@@ -1,5 +1,20 @@
 This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
+## Call logs (Android)
+
+This app includes **native Android call log** support:
+
+- **Permissions** (declared in `android/app/src/main/AndroidManifest.xml`):
+  - `READ_CALL_LOG` – read call history
+  - `READ_PHONE_STATE` – phone/SIM state
+  - `READ_PHONE_NUMBERS` – multi-SIM (Android 8+)
+  - `WRITE_CALL_LOG` – for future delete/export features
+
+- **Runtime**: The app requests these permissions at runtime; the user must grant them to load call logs.
+- **Capabilities**: Load and display the last 100 call log entries (number, type, date, duration, contact name) via `react-native-call-log`.
+
+**Note:** Call log access is Android-only; iOS does not allow third-party apps to read call history.
+
 # Getting Started
 
 > **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
@@ -84,7 +99,61 @@ You've successfully run and modified your React Native App. :partying_face:
 
 # Troubleshooting
 
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
+## Android: "Unable to locate a Java Runtime" / "adb: command not found"
+
+You need a **JDK** and the **Android SDK** (which provides `adb` and the emulator).
+
+### 1. Install Java 17 (required for Gradle)
+
+On macOS with Homebrew:
+
+```bash
+brew install openjdk@17
+```
+
+Then set `JAVA_HOME` in your shell (add to `~/.zshrc` so it persists):
+
+```bash
+export JAVA_HOME="/opt/homebrew/opt/openjdk@17"   # Apple Silicon
+# OR
+export JAVA_HOME="/usr/local/opt/openjdk@17"     # Intel Mac
+export PATH="$JAVA_HOME/bin:$PATH"
+```
+
+Reload your shell (`source ~/.zshrc`) or open a new terminal, then confirm:
+
+```bash
+java -version
+# Should show openjdk 17.x
+```
+
+### 2. Install Android SDK (adb + emulator)
+
+- **Option A – Android Studio (easiest):** Install [Android Studio](https://developer.android.com/studio). During setup it installs the SDK. Then add its tools to your PATH (add to `~/.zshrc`):
+
+  ```bash
+  export ANDROID_HOME="$HOME/Library/Android/sdk"
+  export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$ANDROID_HOME/tools:$ANDROID_HOME/tools/bin:$PATH"
+  ```
+
+- **Option B – Command-line tools only:** Download the [command-line tools](https://developer.android.com/studio#command-tools) and install the SDK packages you need (platform-tools, emulator, a system image).
+
+### 3. Emulator (optional)
+
+- If you use Android Studio: **Device Manager** → **Create Device** → pick a device and system image → create an AVD. Then start it from the Device Manager or run `emulator -avd <avd_name>`.
+- Or connect a **physical Android device** with USB debugging enabled; `npm run android` will install the app on it once `adb` is in PATH.
+
+### 4. Verify
+
+```bash
+npx react-native doctor
+```
+
+Then run `npm run android` again from the project root.
+
+---
+
+For other issues, see the [React Native Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
 
 # Learn More
 
