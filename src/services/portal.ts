@@ -2,6 +2,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
 
 const PORTAL_URL_KEY = '@ritu_portal_url';
+const DEVICE_NAME_KEY = '@ritu_device_name';
+const DEVICE_PHONE_KEY = '@ritu_device_phone';
 const DEFAULT_PORTAL_URL = 'https://your-portal-api.com/calls'; // Replace with your endpoint
 
 export async function getPortalUrl(): Promise<string> {
@@ -15,6 +17,36 @@ export async function getPortalUrl(): Promise<string> {
 
 export async function setPortalUrl(url: string): Promise<void> {
   await AsyncStorage.setItem(PORTAL_URL_KEY, url.trim() || DEFAULT_PORTAL_URL);
+}
+
+export interface DeviceInfo {
+  deviceName: string;
+  devicePhone: string;
+}
+
+export async function getDeviceInfo(): Promise<DeviceInfo> {
+  try {
+    const [name, phone] = await Promise.all([
+      AsyncStorage.getItem(DEVICE_NAME_KEY),
+      AsyncStorage.getItem(DEVICE_PHONE_KEY),
+    ]);
+    return {
+      deviceName: name ?? '',
+      devicePhone: phone ?? '',
+    };
+  } catch {
+    return {
+      deviceName: '',
+      devicePhone: '',
+    };
+  }
+}
+
+export async function setDeviceInfo(deviceName: string, devicePhone: string): Promise<void> {
+  await Promise.all([
+    AsyncStorage.setItem(DEVICE_NAME_KEY, deviceName.trim()),
+    AsyncStorage.setItem(DEVICE_PHONE_KEY, devicePhone.trim()),
+  ]);
 }
 
 export interface PushResult {
@@ -31,7 +63,10 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
     };
   }
   try {
+    const deviceInfo = await getDeviceInfo();
     const payload = {
+      deviceName: deviceInfo.deviceName,
+      devicePhone: deviceInfo.devicePhone,
       calls: calls.map((c) => ({
         id: c.id,
         phoneNumber: c.phoneNumber,

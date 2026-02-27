@@ -10,21 +10,34 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
-import { getPortalUrl, setPortalUrl } from '../services/portal';
+import { getDeviceInfo, getPortalUrl, setDeviceInfo, setPortalUrl } from '../services/portal';
 import { theme } from '../theme';
 
 export function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const [url, setUrl] = useState('');
+  const [deviceName, setDeviceName] = useState('');
+  const [devicePhone, setDevicePhone] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
     let mounted = true;
-    getPortalUrl().then((u) => {
-      if (mounted) setUrl(u);
-    }).finally(() => { if (mounted) setLoading(false); });
+    Promise.all([getPortalUrl(), getDeviceInfo()])
+      .then(([u, info]) => {
+        if (!mounted) {
+          return;
+        }
+        setUrl(u);
+        setDeviceName(info.deviceName);
+        setDevicePhone(info.devicePhone);
+      })
+      .finally(() => {
+        if (mounted) {
+          setLoading(false);
+        }
+      });
     return () => { mounted = false; };
   }, []);
 
@@ -33,12 +46,15 @@ export function SettingsScreen() {
     setSaving(true);
     setSaved(false);
     try {
-      await setPortalUrl(url);
+      await Promise.all([
+        setPortalUrl(url),
+        setDeviceInfo(deviceName, devicePhone),
+      ]);
       setSaved(true);
     } finally {
       setSaving(false);
     }
-  }, [url]);
+  }, [url, deviceName, devicePhone]);
 
   if (loading) {
     return (
@@ -62,6 +78,25 @@ export function SettingsScreen() {
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
+        />
+        <Text style={styles.label}>Device name</Text>
+        <Text style={styles.hint}>Friendly name to identify this phone (e.g. Front Desk, Doctor 1).</Text>
+        <TextInput
+          style={styles.input}
+          value={deviceName}
+          onChangeText={setDeviceName}
+          placeholder="e.g. Reception Phone"
+          placeholderTextColor={theme.colors.tabInactive}
+        />
+        <Text style={styles.label}>Device phone number</Text>
+        <Text style={styles.hint}>The SIM/primary phone number of this device.</Text>
+        <TextInput
+          style={styles.input}
+          value={devicePhone}
+          onChangeText={setDevicePhone}
+          placeholder="+91..."
+          placeholderTextColor={theme.colors.tabInactive}
+          keyboardType="phone-pad"
         />
         <TouchableOpacity
           style={[styles.button, saving && styles.buttonDisabled]}
