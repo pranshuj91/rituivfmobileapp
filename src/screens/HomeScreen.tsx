@@ -3,6 +3,7 @@ import { StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { theme } from '../theme';
+import { Logo } from '../components/Logo';
 
 export function HomeScreen() {
   const insets = useSafeAreaInsets();
@@ -11,7 +12,7 @@ export function HomeScreen() {
     <View style={[styles.container, { paddingTop: insets.top + theme.spacing.lg }]}>
       <View style={styles.hero}>
         <View style={styles.iconWrap}>
-          <Icon name="phone-in-talk" size={48} color={theme.colors.primary} />
+          <Logo width={80} height={40} />
         </View>
         <Text style={styles.title}>Ritu IVF</Text>
         <Text style={styles.subtitle}>Call logs & portal sync</Text>
