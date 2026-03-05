@@ -1,23 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
 
-const PORTAL_URL_KEY = '@ritu_portal_url';
+/** Portal API URL – set in code; not configurable in Settings. */
+const PORTAL_API_URL = 'https://leadtracker.gaincafe.com/api/call-logs/sync';
+
 const DEVICE_NAME_KEY = '@ritu_device_name';
 const DEVICE_PHONE_KEY = '@ritu_device_phone';
-const DEFAULT_PORTAL_URL = 'https://your-portal-api.com/calls'; // Replace with your endpoint
-
-export async function getPortalUrl(): Promise<string> {
-  try {
-    const url = await AsyncStorage.getItem(PORTAL_URL_KEY);
-    return url ?? DEFAULT_PORTAL_URL;
-  } catch {
-    return DEFAULT_PORTAL_URL;
-  }
-}
-
-export async function setPortalUrl(url: string): Promise<void> {
-  await AsyncStorage.setItem(PORTAL_URL_KEY, url.trim() || DEFAULT_PORTAL_URL);
-}
 
 export interface DeviceInfo {
   deviceName: string;
@@ -55,13 +43,6 @@ export interface PushResult {
 }
 
 export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
-  const baseUrl = await getPortalUrl();
-  if (!baseUrl || baseUrl === DEFAULT_PORTAL_URL) {
-    return {
-      success: false,
-      message: 'Set your portal URL in Settings first.',
-    };
-  }
   try {
     const deviceInfo = await getDeviceInfo();
     const payload = {
@@ -79,7 +60,7 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
       })),
       sentAt: new Date().toISOString(),
     };
-    const res = await fetch(baseUrl, {
+    const res = await fetch(PORTAL_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

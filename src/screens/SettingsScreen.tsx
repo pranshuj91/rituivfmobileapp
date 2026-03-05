@@ -10,12 +10,11 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
-import { getDeviceInfo, getPortalUrl, setDeviceInfo, setPortalUrl } from '../services/portal';
+import { getDeviceInfo, setDeviceInfo } from '../services/portal';
 import { theme } from '../theme';
 
 export function SettingsScreen() {
   const insets = useSafeAreaInsets();
-  const [url, setUrl] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [devicePhone, setDevicePhone] = useState('');
   const [loading, setLoading] = useState(true);
@@ -24,19 +23,14 @@ export function SettingsScreen() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([getPortalUrl(), getDeviceInfo()])
-      .then(([u, info]) => {
-        if (!mounted) {
-          return;
-        }
-        setUrl(u);
+    getDeviceInfo()
+      .then((info) => {
+        if (!mounted) return;
         setDeviceName(info.deviceName);
         setDevicePhone(info.devicePhone);
       })
       .finally(() => {
-        if (mounted) {
-          setLoading(false);
-        }
+        if (mounted) setLoading(false);
       });
     return () => { mounted = false; };
   }, []);
@@ -46,15 +40,12 @@ export function SettingsScreen() {
     setSaving(true);
     setSaved(false);
     try {
-      await Promise.all([
-        setPortalUrl(url),
-        setDeviceInfo(deviceName, devicePhone),
-      ]);
+      await setDeviceInfo(deviceName, devicePhone);
       setSaved(true);
     } finally {
       setSaving(false);
     }
-  }, [url, deviceName, devicePhone]);
+  }, [deviceName, devicePhone]);
 
   if (loading) {
     return (
@@ -67,18 +58,6 @@ export function SettingsScreen() {
   return (
     <View style={[styles.container, { paddingTop: insets.top + theme.spacing.lg }]}>
       <View style={styles.section}>
-        <Text style={styles.label}>Portal API URL</Text>
-        <Text style={styles.hint}>POST endpoint where call logs will be sent (JSON).</Text>
-        <TextInput
-          style={styles.input}
-          value={url}
-          onChangeText={setUrl}
-          placeholder="https://your-api.com/calls"
-          placeholderTextColor={theme.colors.tabInactive}
-          autoCapitalize="none"
-          autoCorrect={false}
-          keyboardType="url"
-        />
         <Text style={styles.label}>Device name</Text>
         <Text style={styles.hint}>Friendly name to identify this phone (e.g. Front Desk, Doctor 1).</Text>
         <TextInput

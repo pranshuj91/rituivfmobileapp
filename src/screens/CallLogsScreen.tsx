@@ -36,9 +36,10 @@ interface CallLogItemProps {
   item: CallLog;
   onPush: (call: CallLog) => void;
   pushing: boolean;
+  synced: boolean;
 }
 
-function CallLogItemRow({ item, onPush, pushing }: CallLogItemProps) {
+function CallLogItemRow({ item, onPush, pushing, synced }: CallLogItemProps) {
   return (
     <View style={styles.logItem}>
       <View style={styles.logMain}>
@@ -58,17 +59,24 @@ function CallLogItemRow({ item, onPush, pushing }: CallLogItemProps) {
           <Text style={styles.logName} numberOfLines={1}>{item.name}</Text>
         ) : null}
       </View>
-      <TouchableOpacity
-        style={styles.pushBtn}
-        onPress={() => onPush(item)}
-        disabled={pushing}
-      >
-        {pushing ? (
-          <ActivityIndicator size="small" color={theme.colors.primary} />
-        ) : (
-          <Icon name="cloud-upload-outline" size={22} color={theme.colors.primary} />
-        )}
-      </TouchableOpacity>
+      {synced ? (
+        <View style={styles.syncedBadge}>
+          <Icon name="check-circle" size={20} color={theme.colors.success} />
+          <Text style={styles.syncedText}>Synced</Text>
+        </View>
+      ) : (
+        <TouchableOpacity
+          style={styles.pushBtn}
+          onPress={() => onPush(item)}
+          disabled={pushing}
+        >
+          {pushing ? (
+            <ActivityIndicator size="small" color={theme.colors.primary} />
+          ) : (
+            <Icon name="cloud-upload-outline" size={22} color={theme.colors.primary} />
+          )}
+        </TouchableOpacity>
+      )}
     </View>
   );
 }
@@ -79,6 +87,7 @@ export function CallLogsScreen() {
   const [logs, setLogs] = useState<CallLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [pushingId, setPushingId] = useState<string | 'all' | null>(null);
+  const [syncedIds, setSyncedIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
   const requestPermissions = useCallback(async () => {
@@ -127,6 +136,9 @@ export function CallLogsScreen() {
     setPushingId(call.id);
     const result = await pushSingleCallToPortal(call);
     setPushingId(null);
+    if (result.success) {
+      setSyncedIds((prev) => new Set([...prev, call.id]));
+    }
     Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, []);
 
@@ -138,6 +150,9 @@ export function CallLogsScreen() {
     setPushingId('all');
     const result = await pushCallsToPortal(logs);
     setPushingId(null);
+    if (result.success) {
+      setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
+    }
     Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, [logs]);
 
@@ -232,6 +247,7 @@ export function CallLogsScreen() {
                 item={item}
                 onPush={handlePushOne}
                 pushing={pushingId === item.id}
+                synced={syncedIds.has(item.id)}
               />
             )}
             style={styles.list}
@@ -402,6 +418,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginLeft: theme.spacing.xs,
+  },
+  syncedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginLeft: theme.spacing.xs,
+  },
+  syncedText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.success,
   },
   errorBox: {
     backgroundColor: theme.colors.white,

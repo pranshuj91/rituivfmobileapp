@@ -20,7 +20,7 @@ export function HomeScreen() {
       <View style={styles.card}>
         <Icon name="information-outline" size={22} color={theme.colors.primary} />
         <Text style={styles.cardText}>
-          Open <Text style={styles.bold}>Call logs</Text> to load calls and push them to your portal. Set your portal URL in <Text style={styles.bold}>Settings</Text>.
+          Open <Text style={styles.bold}>Call logs</Text> to load calls and push them to your portal. Set your device name and phone in <Text style={styles.bold}>Settings</Text>.
         </Text>
       </View>
     </View>
