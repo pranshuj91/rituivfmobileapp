@@ -1,9 +1,11 @@
 /**
  * Ritu IVF Mobile App – Bottom navigation, call logs, push to portal.
+ * Scheduled sync runs every 3 hours and when app becomes active (if 3+ hours since last sync).
  */
 
-import React from 'react';
-import { StatusBar } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { AppState, AppStateStatus, StatusBar } from 'react-native';
+import { runScheduledSync, shouldRunSyncNow } from './src/services/syncSchedule';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -31,7 +33,41 @@ function TabIcon({
   );
 }
 
+const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+
 export default function App() {
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+
+  useEffect(() => {
+    // Run sync once shortly after launch if 3+ hours since last sync (or never synced)
+    const t = setTimeout(() => {
+      shouldRunSyncNow().then((ok) => {
+        if (ok) runScheduledSync();
+      });
+    }, 2000);
+
+    // Every 3 hours while app is in memory
+    intervalRef.current = setInterval(runScheduledSync, THREE_HOURS_MS);
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      const becameActive =
+        appStateRef.current.match(/inactive|background/) && nextState === 'active';
+      appStateRef.current = nextState;
+      if (becameActive) {
+        shouldRunSyncNow().then((ok) => {
+          if (ok) runScheduledSync();
+        });
+      }
+    });
+
+    return () => {
+      clearTimeout(t);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      sub.remove();
+    };
+  }, []);
+
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="dark-content" backgroundColor={theme.colors.white} />

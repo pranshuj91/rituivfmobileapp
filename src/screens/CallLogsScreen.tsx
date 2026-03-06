@@ -14,13 +14,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import CallLogs from 'react-native-call-log';
 import type { CallLog } from 'react-native-call-log';
-import { pushCallsToPortal, pushSingleCallToPortal } from '../services/portal';
+import { pushCallsToPortal, pushSingleCallToPortal, setLastSyncedAt } from '../services/portal';
 import { theme } from '../theme';
 
 const CALL_LOG_PERMISSIONS = [
   PermissionsAndroid.PERMISSIONS.READ_CALL_LOG,
   PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
-  ...(Platform.Version >= 26
+  ...(Number(Platform.Version) >= 26
     ? [PermissionsAndroid.PERMISSIONS.READ_PHONE_NUMBERS]
     : []),
 ];
@@ -138,6 +138,7 @@ export function CallLogsScreen() {
     setPushingId(null);
     if (result.success) {
       setSyncedIds((prev) => new Set([...prev, call.id]));
+      await setLastSyncedAt(Date.now());
     }
     Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, []);
@@ -152,6 +153,7 @@ export function CallLogsScreen() {
     setPushingId(null);
     if (result.success) {
       setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
+      await setLastSyncedAt(Date.now());
     }
     Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, [logs]);
