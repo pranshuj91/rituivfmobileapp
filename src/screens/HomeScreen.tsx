@@ -14,7 +14,7 @@ export function HomeScreen() {
         <View style={styles.iconWrap}>
           <Logo width={80} height={40} />
         </View>
-        <Text style={styles.title}>Ritu IVF</Text>
+        <Text style={styles.title}>RITU IVF</Text>
         <Text style={styles.subtitle}>Call logs & portal sync</Text>
       </View>
       <View style={styles.card}>
