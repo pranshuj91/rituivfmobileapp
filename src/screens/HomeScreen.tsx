@@ -12,12 +12,11 @@ export function HomeScreen() {
       <View style={styles.hero}>
         <View style={styles.iconWrap}>
           <Image
-            source={require('../../assets/logo_ritu_ivf.png')}
+            source={require('../../assets/logo_ritu_ivf_transparent.png')}
             style={styles.logoImage}
             resizeMode="contain"
           />
         </View>
-        <Text style={styles.title}>RITU IVF</Text>
         <Text style={styles.subtitle}>Call logs & portal sync</Text>
       </View>
       <View style={styles.card}>
