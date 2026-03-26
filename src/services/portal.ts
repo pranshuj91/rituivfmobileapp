@@ -63,6 +63,18 @@ export interface PushResult {
   count?: number;
 }
 
+function toCalledAt(c: CallLog): string {
+  const rawTs = typeof c.timestamp === 'string' ? Number(c.timestamp) : c.timestamp;
+  const ts = Number.isFinite(rawTs)
+    ? (rawTs as number) > 1e12
+      ? (rawTs as number)
+      : (rawTs as number) * 1000
+    : NaN;
+  const date = Number.isFinite(ts) ? new Date(ts as number) : new Date();
+  // Backend expects "YYYY-MM-DD HH:mm:ss"
+  return date.toISOString().slice(0, 19).replace('T', ' ');
+}
+
 export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
   try {
     const deviceInfo = await getDeviceInfo();
@@ -70,6 +82,7 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
       logs: calls.map((c) => ({
         id: c.id,
         phone_number: c.phoneNumber,
+        called_at: toCalledAt(c),
         formatted_number: c.formattedNumber,
         duration: c.duration,
         name: c.name,
@@ -78,6 +91,7 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
         type: c.type,
         // Keep camelCase fields too for compatibility.
         phoneNumber: c.phoneNumber,
+        calledAt: toCalledAt(c),
         formattedNumber: c.formattedNumber,
         dateTime: c.dateTime,
       })),
@@ -85,7 +99,10 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
       sentAt: new Date().toISOString(),
     };
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    };
     if (X_APP_KEY) headers['X-App-Key'] = X_APP_KEY;
     if (AUTHORIZATION) headers['Authorization'] = AUTHORIZATION;
     const res = await fetch(PORTAL_API_URL, {
@@ -105,7 +122,16 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
         : `Portal responded with ${res.status}`;
       return { success: false, message: msg };
     }
-    return { success: true, message: `${calls.length} call(s) pushed to portal.`, count: calls.length };
+    let apiMessage = `${calls.length} call(s) pushed to portal.`;
+    let savedCount = calls.length;
+    try {
+      const json = (await res.json()) as { message?: string; saved?: number };
+      if (json.message) apiMessage = json.message;
+      if (typeof json.saved === 'number') savedCount = json.saved;
+    } catch {
+      // Keep fallback success message
+    }
+    return { success: true, message: apiMessage, count: savedCount };
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Network error';
     return { success: false, message: msg };
