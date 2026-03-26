@@ -69,13 +69,17 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
     const payload = {
       logs: calls.map((c) => ({
         id: c.id,
-        phoneNumber: c.phoneNumber,
-        formattedNumber: c.formattedNumber,
+        phone_number: c.phoneNumber,
+        formatted_number: c.formattedNumber,
         duration: c.duration,
         name: c.name,
         timestamp: c.timestamp,
-        dateTime: c.dateTime,
+        date_time: c.dateTime,
         type: c.type,
+        // Keep camelCase fields too for compatibility.
+        phoneNumber: c.phoneNumber,
+        formattedNumber: c.formattedNumber,
+        dateTime: c.dateTime,
       })),
       ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
@@ -90,7 +94,16 @@ export async function pushCallsToPortal(calls: CallLog[]): Promise<PushResult> {
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
-      return { success: false, message: `Portal responded with ${res.status}` };
+      let details = '';
+      try {
+        details = await res.text();
+      } catch {
+        details = '';
+      }
+      const msg = details
+        ? `Portal responded with ${res.status}: ${details}`
+        : `Portal responded with ${res.status}`;
+      return { success: false, message: msg };
     }
     return { success: true, message: `${calls.length} call(s) pushed to portal.`, count: calls.length };
   } catch (e) {
