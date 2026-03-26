@@ -1,9 +1,8 @@
 import React from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Image, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import { theme } from '../theme';
-import { Logo } from '../components/Logo';
 
 export function HomeScreen() {
   const insets = useSafeAreaInsets();
@@ -12,7 +11,11 @@ export function HomeScreen() {
     <View style={[styles.container, { paddingTop: insets.top + theme.spacing.lg }]}>
       <View style={styles.hero}>
         <View style={styles.iconWrap}>
-          <Logo width={80} height={40} />
+          <Image
+            source={require('../../assets/logo_ritu_ivf.png')}
+            style={styles.logoImage}
+            resizeMode="contain"
+          />
         </View>
         <Text style={styles.title}>RITU IVF</Text>
         <Text style={styles.subtitle}>Call logs & portal sync</Text>
@@ -38,14 +41,15 @@ const styles = StyleSheet.create({
     marginBottom: theme.spacing.xl,
   },
   iconWrap: {
-    width: 96,
+    width: 220,
     height: 96,
-    borderRadius: theme.radius.lg,
-    backgroundColor: theme.colors.white,
     alignItems: 'center',
     justifyContent: 'center',
     marginBottom: theme.spacing.md,
-    ...theme.shadows.md,
+  },
+  logoImage: {
+    width: 220,
+    height: 80,
   },
   title: {
     fontSize: 28,
