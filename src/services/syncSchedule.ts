@@ -16,6 +16,7 @@ import {
   pushCallsToPortal,
   setLastSyncedAt,
 } from './portal';
+import { buildRecordingSyncOptions } from './recordings';
 
 /** Max calls per request to keep payload size reasonable. */
 const BATCH_LIMIT = 100;
@@ -53,7 +54,8 @@ export async function runScheduledSync(): Promise<void> {
 
     if (callsToSend.length === 0) return;
 
-    const result = await pushCallsToPortal(callsToSend);
+    const syncOptions = await buildRecordingSyncOptions(callsToSend);
+    const result = await pushCallsToPortal(callsToSend, syncOptions);
     if (result.success) {
       const newestTs = Math.max(...callsToSend.map(getCallTimeMs));
       await setLastSyncedAt(newestTs);

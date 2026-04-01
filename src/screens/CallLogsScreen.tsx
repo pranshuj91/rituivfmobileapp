@@ -15,11 +15,15 @@ import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import CallLogs from 'react-native-call-log';
 import type { CallLog } from 'react-native-call-log';
 import { pushCallsToPortal, pushSingleCallToPortal, setLastSyncedAt } from '../services/portal';
+import { buildRecordingSyncOptions } from '../services/recordings';
 import { theme } from '../theme';
 
 const CALL_LOG_PERMISSIONS = [
   PermissionsAndroid.PERMISSIONS.READ_CALL_LOG,
   PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+  ...(Number(Platform.Version) >= 33
+    ? [PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO]
+    : [PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE]),
   ...(Number(Platform.Version) >= 26
     ? [PermissionsAndroid.PERMISSIONS.READ_PHONE_NUMBERS]
     : []),
@@ -134,7 +138,8 @@ export function CallLogsScreen() {
 
   const handlePushOne = useCallback(async (call: CallLog) => {
     setPushingId(call.id);
-    const result = await pushSingleCallToPortal(call);
+    const syncOptions = await buildRecordingSyncOptions([call]);
+    const result = await pushSingleCallToPortal(call, syncOptions);
     setPushingId(null);
     if (result.success) {
       setSyncedIds((prev) => new Set([...prev, call.id]));
@@ -149,7 +154,8 @@ export function CallLogsScreen() {
       return;
     }
     setPushingId('all');
-    const result = await pushCallsToPortal(logs);
+    const syncOptions = await buildRecordingSyncOptions(logs);
+    const result = await pushCallsToPortal(logs, syncOptions);
     setPushingId(null);
     if (result.success) {
       setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
