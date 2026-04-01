@@ -1,8 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
+import RNFS from 'react-native-fs';
 
 /** Portal API URL – set in code; not configurable in Settings. */
 const PORTAL_API_URL = 'https://leadtracker.gaincafe.com/api/call-logs/sync';
+const RECORDING_UPLOAD_URL = 'https://leadtracker.gaincafe.com/api/call-logs/upload-recording';
 
 /** Optional: set in code if your backend requires these headers. */
 const CALL_LOG_APP_KEY = ''; // e.g. 'your-app-key'
@@ -11,6 +13,8 @@ const AUTHORIZATION = ''; // e.g. 'Bearer token'
 const DEVICE_NAME_KEY = '@ritu_device_name';
 const DEVICE_PHONE_KEY = '@ritu_device_phone';
 const LAST_SYNCED_AT_KEY = '@ritu_last_synced_at';
+const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
+const STRICT_PAIR_WINDOW_MS = 120 * 1000;
 
 export interface DeviceInfo {
   deviceName: string;
@@ -77,6 +81,8 @@ export interface RecordingPayload {
   recording_external_id?: string;
   recording_url?: string;
   duration_seconds?: number;
+  source?: string;
+  recorded_at?: string;
   // Backward compatible alias
   recording_duration?: number;
 }
@@ -127,7 +133,146 @@ function toRecordingArray(list?: RecordingPayload[]): Array<Record<string, unkno
     ...(r.duration_seconds ?? r.recording_duration
       ? { duration_seconds: r.duration_seconds ?? r.recording_duration }
       : {}),
+    ...(r.source ? { source: r.source } : {}),
+    ...(r.recorded_at ? { recorded_at: r.recorded_at } : {}),
   }));
+}
+
+function normalizeDigits(input?: string | null): string {
+  return (input ?? '').replace(/\D/g, '');
+}
+
+function extractPhoneFromRecordingExternalId(externalId?: string): string {
+  if (!externalId) return '';
+  const head = externalId.split(':')[0] ?? externalId;
+  const digits = normalizeDigits(head);
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+function parseRecordingExternalId(externalId: string): { recCallId: string; recPhoneLast10: string } {
+  if (!externalId) return { recCallId: '', recPhoneLast10: '' };
+  const idx = externalId.lastIndexOf(':');
+  const head = idx >= 0 ? externalId.slice(0, idx) : externalId;
+  const tail = idx >= 0 ? externalId.slice(idx + 1) : '';
+  // recording_external_id format example:
+  // +919602999299-2604011548.mp3:160
+  // Phone must be extracted from the filename prefix (before first dash),
+  // not from all digits in head (which includes timestamp digits).
+  const fileNameOnly = head.split('/').pop() ?? head;
+  const beforeDash = fileNameOnly.split('-')[0] ?? fileNameOnly;
+  const recPhoneDigits = normalizeDigits(beforeDash);
+  const recPhoneLast10 = recPhoneDigits.slice(-10);
+  const recCallId = tail.trim();
+  return { recCallId, recPhoneLast10 };
+}
+
+function toMsFromCalledAt(value?: unknown): number {
+  if (typeof value !== 'string') return 0;
+  const t = Date.parse(value.replace(' ', 'T'));
+  return Number.isFinite(t) ? t : 0;
+}
+
+function strictRecordingMatchesCall(recording: Record<string, unknown>, log: Record<string, unknown>): boolean {
+  const recExtId = String(recording.recording_external_id ?? '');
+  const callId = String(log.callId ?? log.id ?? '');
+  const callPhoneLast10 = normalizeDigits(String(log.phone_number ?? '')).slice(-10);
+  const { recCallId, recPhoneLast10 } = parseRecordingExternalId(recExtId);
+
+  // Primary matcher: exact callId match, and if phone is embedded it must also match.
+  if (recCallId) {
+    if (recCallId !== callId) return false;
+    return !recPhoneLast10 || recPhoneLast10 === callPhoneLast10;
+  }
+
+  // Secondary matcher: exact phone(last10) + close time window.
+  const phoneMatches = !!recPhoneLast10 && recPhoneLast10 === callPhoneLast10;
+  const recAt = toMsFromCalledAt(recording.recorded_at);
+  const callAt = toMsFromCalledAt(log.called_at);
+  const timeMatches = recAt && callAt ? Math.abs(recAt - callAt) <= STRICT_PAIR_WINDOW_MS : false;
+  if (phoneMatches && timeMatches) return true;
+
+  // Fallback (only when recCallId is not parsable): same uploaded callId + close time.
+  const uploadedForCallId = String(recording.__uploaded_for_call_id ?? '');
+  const sameCall = uploadedForCallId && uploadedForCallId === callId;
+  if (!sameCall) return false;
+  return !recAt || !callAt || Math.abs(recAt - callAt) <= STRICT_PAIR_WINDOW_MS;
+}
+
+async function uploadRecordingIfNeeded(
+  recording: Record<string, unknown>,
+  callId: string
+): Promise<Record<string, unknown> | null> {
+  const rawUrl = typeof recording.recording_url === 'string' ? recording.recording_url : '';
+  if (!rawUrl) return recording;
+  if (!rawUrl.startsWith('file://')) return recording;
+  if (!RECORDING_UPLOAD_URL) return null;
+
+  const filePath = rawUrl.replace('file://', '');
+  const exists = await RNFS.exists(filePath);
+  if (!exists) return null;
+
+  try {
+    const filename = filePath.split('/').pop() || 'recording.mp3';
+    const uploadHeaders: Record<string, string> = {
+      Accept: 'application/json',
+    };
+    if (CALL_LOG_APP_KEY) uploadHeaders['X-App-Key'] = CALL_LOG_APP_KEY;
+    if (AUTHORIZATION) uploadHeaders['Authorization'] = AUTHORIZATION;
+    const uploadRes = await RNFS.uploadFiles({
+      toUrl: RECORDING_UPLOAD_URL,
+      files: [
+        {
+          name: 'file',
+          filename,
+          filepath: filePath,
+          filetype: 'audio/mpeg',
+        },
+      ],
+      method: 'POST',
+      headers: uploadHeaders,
+      fields: {
+        recording_external_id: String(recording.recording_external_id ?? ''),
+        source: String(recording.source ?? 'mobile_app'),
+      },
+    }).promise;
+
+    if (uploadRes.statusCode < 200 || uploadRes.statusCode >= 300) {
+      return null;
+    }
+
+    let uploadedUrl = '';
+    try {
+      const json = JSON.parse(uploadRes.body || '{}') as {
+        url?: string;
+        recording_url?: string;
+        data?: { url?: string; recording_url?: string };
+      };
+      uploadedUrl = json.recording_url ?? json.url ?? json.data?.recording_url ?? json.data?.url ?? '';
+    } catch {
+      uploadedUrl = '';
+    }
+
+    if (!uploadedUrl) return null;
+    const uploaded: Record<string, unknown> = {
+      ...recording,
+      recording_url: uploadedUrl,
+    };
+    // Save upload mapping per callId immediately after upload success.
+    const key = callId;
+    const list = uploadedRecordingsByCallId.get(key) ?? [];
+    list.push({
+      recording_url: String(uploaded.recording_url ?? ''),
+      recording_external_id: String(recording.recording_external_id ?? ''),
+      duration_seconds: recording.duration_seconds,
+      source: recording.source,
+      recorded_at: recording.recorded_at,
+      __uploaded_for_call_id: callId,
+    });
+    uploadedRecordingsByCallId.set(key, list);
+    return uploaded;
+  } catch {
+    return null;
+  }
 }
 
 export async function pushCallsToPortal(
@@ -136,35 +281,119 @@ export async function pushCallsToPortal(
 ): Promise<PushResult> {
   try {
     const deviceInfo = await getDeviceInfo();
-    const payload = {
-      logs: calls.map((c) => {
-        const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
-        const recordings = toRecordingArray(options.recordingsByCallId?.[c.id]);
-        return {
-          phone_number: c.phoneNumber,
-          direction: toDirection(c.type),
-          duration_seconds: c.duration,
-          called_at: toCalledAt(c),
-          ...(recordings && recordings[0]?.recording_url
-            ? { recording_url: String(recordings[0].recording_url) }
-            : {}),
-          ...(recordings && recordings[0]?.recording_external_id
-            ? { recording_external_id: String(recordings[0].recording_external_id) }
-            : {}),
-          ...(recordings ? { recordings } : {}),
-          ...singleRec,
-        };
-      }),
-      ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
-      ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
-      sentAt: new Date().toISOString(),
-    };
     const headers: Record<string, string> = {
       Accept: 'application/json',
       'Content-Type': 'application/json',
     };
     if (CALL_LOG_APP_KEY) headers['X-App-Key'] = CALL_LOG_APP_KEY;
     if (AUTHORIZATION) headers['Authorization'] = AUTHORIZATION;
+
+    const logsBase = await Promise.all(calls.map(async (c) => {
+      const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
+      const recordings = toRecordingArray(options.recordingsByCallId?.[c.id]);
+      // Send a single unified recordings[] array to avoid duplicate payload forms.
+      const mergedRecordingsRaw = recordings ?? (Object.keys(singleRec).length > 0 ? [singleRec] : []);
+      const calledAt = toCalledAt(c);
+      const mergedRecordingCandidates = await Promise.all(
+        mergedRecordingsRaw.map((r) =>
+          uploadRecordingIfNeeded(r, c.id)
+        )
+      );
+      return {
+        id: c.id,
+        callId: c.id,
+        phone_number: c.phoneNumber,
+        direction: toDirection(c.type),
+        duration_seconds: c.duration,
+        called_at: calledAt,
+      };
+    }));
+
+    const uploadSucceededCount = Array.from(uploadedRecordingsByCallId.values()).reduce(
+      (acc, list) => acc + list.length,
+      0
+    );
+
+    // Merge uploaded recordings into logs[] by callId.
+    const usedExternalIds = new Set<string>();
+    const usedRecordingUrls = new Set<string>();
+    const logs = logsBase.map((log) => {
+      const recsForCall = uploadedRecordingsByCallId.get(String(log.callId)) ?? [];
+      const recs = recsForCall.filter((r) => {
+        const extId = String(r.recording_external_id ?? '');
+        const recUrl = String(r.recording_url ?? '');
+        if (!strictRecordingMatchesCall(r, log as Record<string, unknown>)) {
+          console.warn('[recording-skip] strict mismatch', {
+            callId: String(log.callId ?? log.id ?? ''),
+            phone: String(log.phone_number ?? ''),
+            recording_external_id: extId,
+          });
+          return false;
+        }
+        if (extId && usedExternalIds.has(extId)) return false;
+        if (recUrl && usedRecordingUrls.has(recUrl)) return false;
+        if (extId) usedExternalIds.add(extId);
+        if (recUrl) usedRecordingUrls.add(recUrl);
+        return true;
+      });
+      return {
+        ...log,
+        recordings: recs,
+      };
+    });
+
+    const payload = {
+      logs,
+      ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
+      ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
+      sentAt: new Date().toISOString(),
+    };
+    if (!payload.logs.some((l) => (l as { recordings?: unknown[] }).recordings?.length)) {
+      console.warn('[sync-payload] no recordings attached in this batch');
+    }
+    const logsWithRecordings = payload.logs.filter((l) => (l as { recordings?: unknown[] }).recordings?.length).length;
+    const totalRecordingItems = payload.logs.reduce((acc, l) => {
+      const n = (l as { recordings?: unknown[] }).recordings?.length ?? 0;
+      return acc + n;
+    }, 0);
+    const samplePairs = payload.logs.slice(0, 2).flatMap((l) => {
+      const recs = (l as { recordings?: Array<Record<string, unknown>> }).recordings ?? [];
+      return recs.slice(0, 1).map((r) => ({
+        callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
+        phone: String((l as Record<string, unknown>).phone_number ?? ''),
+        recording_external_id: String(r.recording_external_id ?? ''),
+      }));
+    });
+    const first2Compact = payload.logs.slice(0, 2).map((l) => ({
+      callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
+      recordingsLength: ((l as { recordings?: unknown[] }).recordings?.length ?? 0),
+    }));
+    console.log('[sync-payload] totals', {
+      totalLogs: payload.logs.length,
+      logsWithRecordings,
+      totalRecordingItems,
+      uploadSucceededCount,
+      samplePairs,
+      first2Compact,
+    });
+    // Hard guard: uploads succeeded but recordings missing in final payload.
+    if (uploadSucceededCount > 0 && totalRecordingItems === 0) {
+      return {
+        success: false,
+        message: 'Recording upload succeeded, but merged sync payload has 0 recordings. Sync blocked.',
+      };
+    }
+    console.log('[sync-payload] logs[0].recordings?.length =', (payload.logs[0] as { recordings?: unknown[] } | undefined)?.recordings?.length ?? 0);
+    console.log('[sync-payload] first 2 logs =', payload.logs.slice(0, 2));
+    const firstWithRecordings = payload.logs.find(
+      (l) => ((l as { recordings?: unknown[] }).recordings?.length ?? 0) > 0
+    );
+    if (firstWithRecordings) {
+      console.log('[sync-payload] sample with recordings =', firstWithRecordings);
+    } else {
+      console.warn('[sync-payload] no non-empty recordings item found before /sync');
+    }
+    console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
     const res = await fetch(PORTAL_API_URL, {
       method: 'POST',
       headers,
@@ -204,6 +433,9 @@ export async function pushCallsToPortal(
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Network error';
     return { success: false, message: msg };
+  } finally {
+    // Keep map until sync call has executed, then clear.
+    uploadedRecordingsByCallId.clear();
   }
 }
 
