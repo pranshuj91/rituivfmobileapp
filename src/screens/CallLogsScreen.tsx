@@ -14,6 +14,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import CallLogs from 'react-native-call-log';
 import type { CallLog } from 'react-native-call-log';
+import Contacts, { type Contact } from 'react-native-contacts';
 import { pushCallsToPortal, pushSingleCallToPortal, setLastSyncedAt } from '../services/portal';
 import { buildRecordingSyncOptions } from '../services/recordings';
 import { theme } from '../theme';
@@ -34,6 +35,41 @@ function formatDuration(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function normalizeDigits(input?: string | null): string {
+  return (input ?? '').replace(/\D/g, '');
+}
+
+async function buildContactNameMap(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  let contacts: Contact[] = [];
+  try {
+    contacts = await Contacts.getAllWithoutPhotos();
+  } catch {
+    return map;
+  }
+  for (const c of contacts) {
+    const displayName = (c.displayName || c.givenName || '').trim();
+    if (!displayName) continue;
+    for (const pn of c.phoneNumbers ?? []) {
+      const digits = normalizeDigits(pn.number);
+      if (!digits) continue;
+      if (digits.length >= 10) map.set(digits.slice(-10), displayName);
+      map.set(digits, displayName);
+    }
+  }
+  return map;
+}
+
+async function hasContactsPermission(): Promise<boolean> {
+  if (Platform.OS !== 'android') return false;
+  try {
+    const granted = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CONTACTS);
+    return granted;
+  } catch {
+    return false;
+  }
 }
 
 interface CallLogItemProps {
@@ -127,7 +163,20 @@ export function CallLogsScreen() {
     setError(null);
     try {
       const list = await CallLogs.load(100);
-      setLogs(list);
+      const canReadContacts = await hasContactsPermission();
+      if (!canReadContacts) {
+        setLogs(list);
+        return;
+      }
+      const contactNames = await buildContactNameMap();
+      const enriched = list.map((item) => {
+        if ((item.name || '').trim().length > 0) return item;
+        const digits = normalizeDigits(item.phoneNumber || item.formattedNumber);
+        const key = digits.length >= 10 ? digits.slice(-10) : digits;
+        const name = contactNames.get(key);
+        return name ? { ...item, name } : item;
+      });
+      setLogs(enriched);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load call logs');
       setLogs([]);

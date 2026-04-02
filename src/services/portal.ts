@@ -142,13 +142,6 @@ function normalizeDigits(input?: string | null): string {
   return (input ?? '').replace(/\D/g, '');
 }
 
-function extractPhoneFromRecordingExternalId(externalId?: string): string {
-  if (!externalId) return '';
-  const head = externalId.split(':')[0] ?? externalId;
-  const digits = normalizeDigits(head);
-  return digits.length >= 10 ? digits.slice(-10) : '';
-}
-
 function parseRecordingExternalId(externalId: string): { recCallId: string; recPhoneLast10: string } {
   if (!externalId) return { recCallId: '', recPhoneLast10: '' };
   const idx = externalId.lastIndexOf(':');
@@ -178,10 +171,11 @@ function strictRecordingMatchesCall(recording: Record<string, unknown>, log: Rec
   const callPhoneLast10 = normalizeDigits(String(log.phone_number ?? '')).slice(-10);
   const { recCallId, recPhoneLast10 } = parseRecordingExternalId(recExtId);
 
-  // Primary matcher: exact callId match, and if phone is embedded it must also match.
+  // Primary matcher: exact callId match.
+  // Phone in recording_external_id is treated as advisory only because
+  // device/provider formatting can differ while callId remains stable in same sync batch.
   if (recCallId) {
-    if (recCallId !== callId) return false;
-    return !recPhoneLast10 || recPhoneLast10 === callPhoneLast10;
+    return recCallId === callId;
   }
 
   // Secondary matcher: exact phone(last10) + close time window.
@@ -217,7 +211,7 @@ async function uploadRecordingIfNeeded(
       Accept: 'application/json',
     };
     if (CALL_LOG_APP_KEY) uploadHeaders['X-App-Key'] = CALL_LOG_APP_KEY;
-    if (AUTHORIZATION) uploadHeaders['Authorization'] = AUTHORIZATION;
+    if (AUTHORIZATION) uploadHeaders.Authorization = AUTHORIZATION;
     const uploadRes = await RNFS.uploadFiles({
       toUrl: RECORDING_UPLOAD_URL,
       files: [
@@ -286,7 +280,7 @@ export async function pushCallsToPortal(
       'Content-Type': 'application/json',
     };
     if (CALL_LOG_APP_KEY) headers['X-App-Key'] = CALL_LOG_APP_KEY;
-    if (AUTHORIZATION) headers['Authorization'] = AUTHORIZATION;
+    if (AUTHORIZATION) headers.Authorization = AUTHORIZATION;
 
     const logsBase = await Promise.all(calls.map(async (c) => {
       const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
@@ -294,15 +288,14 @@ export async function pushCallsToPortal(
       // Send a single unified recordings[] array to avoid duplicate payload forms.
       const mergedRecordingsRaw = recordings ?? (Object.keys(singleRec).length > 0 ? [singleRec] : []);
       const calledAt = toCalledAt(c);
-      const mergedRecordingCandidates = await Promise.all(
-        mergedRecordingsRaw.map((r) =>
-          uploadRecordingIfNeeded(r, c.id)
-        )
-      );
+      await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id)));
+      const phoneNumber = c.phoneNumber || c.formattedNumber || '';
+      const contactName = (c.name || '').trim();
       return {
         id: c.id,
         callId: c.id,
-        phone_number: c.phoneNumber,
+        phone_number: phoneNumber,
+        name: contactName || phoneNumber,
         direction: toDirection(c.type),
         duration_seconds: c.duration,
         called_at: calledAt,

@@ -3,7 +3,7 @@ import type { CallLog } from 'react-native-call-log';
 import type { SyncOptions } from './portal';
 
 const AUDIO_EXT_RE = /\.(mp3|m4a|aac|amr|wav|ogg|3gp)$/i;
-const STRICT_MATCH_WINDOW_MS = 2 * 60 * 1000; // 2 minutes
+const STRICT_MATCH_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
 
 function normalizeDigits(input?: string | null): string {
   return (input ?? '').replace(/\D/g, '');
@@ -31,8 +31,9 @@ function escapeRegExp(s: string): string {
 }
 
 function hasCallIdInName(fileName: string, callId: string): boolean {
-  // Avoid accidental matches for short ids like "91" that appear in "+91..." or timestamps.
-  if (!callId || callId.length < 5) return false;
+  // Avoid accidental matches for very short ids like "9" / "91".
+  // 3+ digits with numeric boundaries are usually safe to match.
+  if (!callId || callId.length < 3) return false;
   const re = new RegExp(`(?:^|[^0-9])${escapeRegExp(callId)}(?:[^0-9]|$)`);
   return re.test(fileName);
 }
@@ -43,6 +44,26 @@ function hasSamePhoneInName(fileName: string, callDigits: string): boolean {
   const d10 = callDigits.slice(-10);
   const d7 = callDigits.slice(-7);
   return (d10.length >= 7 && fileDigits.includes(d10)) || (d7.length >= 7 && fileDigits.includes(d7));
+}
+
+function parseTimestampFromFileName(fileName: string): number {
+  // Many dialers encode local time like yymmddHHMM[ss] in filename.
+  // Example: +919602999299-260402160649.mp3
+  const base = fileName.replace(/\.[^.]+$/, '');
+  const m = base.match(/(?:^|[^0-9])(\d{10,14})(?:[^0-9]|$)/);
+  if (!m?.[1]) return 0;
+  const digits = m[1];
+  const yy = Number(digits.slice(0, 2));
+  const mo = Number(digits.slice(2, 4));
+  const dd = Number(digits.slice(4, 6));
+  const hh = Number(digits.slice(6, 8));
+  const mi = Number(digits.slice(8, 10));
+  const ss = digits.length >= 12 ? Number(digits.slice(10, 12)) : 0;
+  if ([yy, mo, dd, hh, mi, ss].some((n) => !Number.isFinite(n))) return 0;
+  const year = 2000 + yy;
+  if (mo < 1 || mo > 12 || dd < 1 || dd > 31 || hh > 23 || mi > 59 || ss > 59) return 0;
+  const t = new Date(year, mo - 1, dd, hh, mi, ss).getTime();
+  return Number.isFinite(t) ? t : 0;
 }
 
 function belongsToCall(
@@ -57,8 +78,14 @@ function belongsToCall(
   }
   // Strict rule #2: same phone number in filename + very close timestamp.
   const samePhone = hasSamePhoneInName(file.name, callDigits);
-  const closeTime = Math.abs(callTs - file.mtimeMs) <= STRICT_MATCH_WINDOW_MS;
-  return samePhone && closeTime;
+  if (!samePhone) return false;
+  const closeByMtime = Math.abs(callTs - file.mtimeMs) <= STRICT_MATCH_WINDOW_MS;
+  if (closeByMtime) return true;
+  const fileTsFromName = parseTimestampFromFileName(file.name);
+  const closeByNameTime = fileTsFromName
+    ? Math.abs(callTs - fileTsFromName) <= STRICT_MATCH_WINDOW_MS
+    : false;
+  return closeByNameTime;
 }
 
 function matchScore(fileName: string, callId: string, callDigits: string, callTs: number, fileTs: number): number {
@@ -128,7 +155,8 @@ export async function buildRecordingSyncOptions(calls: CallLog[]): Promise<SyncO
 
     const recordingsByCallId: NonNullable<SyncOptions['recordingsByCallId']> = {};
     const usedPaths = new Set<string>();
-    const sortedCalls = [...calls].sort((a, b) => callTimeMs(a) - callTimeMs(b));
+    // Newest-first helps avoid older calls consuming nearby recordings first.
+    const sortedCalls = [...calls].sort((a, b) => callTimeMs(b) - callTimeMs(a));
     for (const c of sortedCalls) {
       const ts = callTimeMs(c);
       if (!ts) continue;
