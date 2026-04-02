@@ -1,27 +1,54 @@
 package com.rituivfmobileapp
 
 import android.app.Application
+import com.facebook.react.common.annotations.UnstableReactNativeAPI
 import com.facebook.react.PackageList
 import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
-import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
+import com.facebook.react.ReactNativeHost
+import com.facebook.react.ReactPackage
+import com.facebook.react.common.ReleaseLevel
+import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.load
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.releaseLevel
+import com.facebook.react.soloader.OpenSourceMergedSoMapping
+import com.facebook.soloader.SoLoader
+import com.facebook.react.modules.systeminfo.AndroidInfoHelpers
+import com.facebook.react.bridge.JavaScriptExecutorFactory
+import io.github.reactnativecommunity.javascriptcore.JSCExecutorFactory
+import io.github.reactnativecommunity.javascriptcore.JSCRuntimeFactory
 
 class MainApplication : Application(), ReactApplication {
 
-  override val reactHost: ReactHost by lazy {
-    getDefaultReactHost(
-      context = applicationContext,
-      packageList =
-        PackageList(this).packages.apply {
-          // Packages that cannot be autolinked yet can be added manually here, for example:
-          // add(MyReactNativePackage())
-        },
-    )
+  override val reactNativeHost: ReactNativeHost =
+      object : DefaultReactNativeHost(this) {
+        override fun getPackages(): List<ReactPackage> =
+            PackageList(this).packages.apply {
+              // Packages that cannot be autolinked yet can be added manually here.
+            }
+
+        override fun getJSMainModuleName(): String = "index"
+
+        override fun getUseDeveloperSupport(): Boolean = BuildConfig.DEBUG
+
+        override val isNewArchEnabled: Boolean = BuildConfig.IS_NEW_ARCHITECTURE_ENABLED
+        override val isHermesEnabled: Boolean = BuildConfig.IS_HERMES_ENABLED
+
+        override fun getJavaScriptExecutorFactory(): JavaScriptExecutorFactory =
+            JSCExecutorFactory(packageName, AndroidInfoHelpers.getFriendlyDeviceName())
   }
+
+  @OptIn(UnstableReactNativeAPI::class)
+  override val reactHost: ReactHost
+    get() = getDefaultReactHost(applicationContext, reactNativeHost, JSCRuntimeFactory())
 
   override fun onCreate() {
     super.onCreate()
-    loadReactNative(this)
+    SoLoader.init(this, OpenSourceMergedSoMapping)
+    if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
+      releaseLevel = ReleaseLevel.STABLE
+      load()
+    }
   }
 }
