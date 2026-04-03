@@ -15,6 +15,8 @@ const DEVICE_PHONE_KEY = '@ritu_device_phone';
 const LAST_SYNCED_AT_KEY = '@ritu_last_synced_at';
 const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
+const UPLOAD_TIMEOUT_MS = 25 * 1000;
+const SYNC_TIMEOUT_MS = 35 * 1000;
 
 export interface DeviceInfo {
   deviceName: string;
@@ -212,7 +214,7 @@ async function uploadRecordingIfNeeded(
     };
     if (CALL_LOG_APP_KEY) uploadHeaders['X-App-Key'] = CALL_LOG_APP_KEY;
     if (AUTHORIZATION) uploadHeaders.Authorization = AUTHORIZATION;
-    const uploadRes = await RNFS.uploadFiles({
+    const uploadPromise = RNFS.uploadFiles({
       toUrl: RECORDING_UPLOAD_URL,
       files: [
         {
@@ -229,6 +231,12 @@ async function uploadRecordingIfNeeded(
         source: String(recording.source ?? 'mobile_app'),
       },
     }).promise;
+
+    const uploadRes = await Promise.race([
+      uploadPromise,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), UPLOAD_TIMEOUT_MS)),
+    ]);
+    if (!uploadRes) return null;
 
     if (uploadRes.statusCode < 200 || uploadRes.statusCode >= 300) {
       return null;
@@ -387,11 +395,14 @@ export async function pushCallsToPortal(
       console.warn('[sync-payload] no non-empty recordings item found before /sync');
     }
     console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
+    const controller = new AbortController();
+    const syncTimeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
     const res = await fetch(PORTAL_API_URL, {
       method: 'POST',
       headers,
       body: JSON.stringify(payload),
-    });
+      signal: controller.signal,
+    }).finally(() => clearTimeout(syncTimeout));
     if (!res.ok) {
       let details = '';
       try {
@@ -424,7 +435,12 @@ export async function pushCallsToPortal(
     }
     return { success: true, message: apiMessage, count: savedCount, results };
   } catch (e) {
-    const msg = e instanceof Error ? e.message : 'Network error';
+    const isAbort = e instanceof Error && e.name === 'AbortError';
+    const msg = isAbort
+      ? `Portal sync timed out after ${Math.floor(SYNC_TIMEOUT_MS / 1000)} seconds`
+      : e instanceof Error
+        ? e.message
+        : 'Network error';
     return { success: false, message: msg };
   } finally {
     // Keep map until sync call has executed, then clear.

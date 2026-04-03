@@ -186,15 +186,21 @@ export function CallLogsScreen() {
   }, []);
 
   const handlePushOne = useCallback(async (call: CallLog) => {
-    setPushingId(call.id);
-    const syncOptions = await buildRecordingSyncOptions([call]);
-    const result = await pushSingleCallToPortal(call, syncOptions);
-    setPushingId(null);
-    if (result.success) {
-      setSyncedIds((prev) => new Set([...prev, call.id]));
-      await setLastSyncedAt(Date.now());
+    try {
+      setPushingId(call.id);
+      const syncOptions = await buildRecordingSyncOptions([call]);
+      const result = await pushSingleCallToPortal(call, syncOptions);
+      if (result.success) {
+        setSyncedIds((prev) => new Set([...prev, call.id]));
+        await setLastSyncedAt(Date.now());
+      }
+      Alert.alert(result.success ? 'Sent' : 'Error', result.message);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to push call';
+      Alert.alert('Error', msg);
+    } finally {
+      setPushingId(null);
     }
-    Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, []);
 
   const handlePushAll = useCallback(async () => {
@@ -202,15 +208,21 @@ export function CallLogsScreen() {
       Alert.alert('No calls', 'Load call logs first.');
       return;
     }
-    setPushingId('all');
-    const syncOptions = await buildRecordingSyncOptions(logs);
-    const result = await pushCallsToPortal(logs, syncOptions);
-    setPushingId(null);
-    if (result.success) {
-      setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
-      await setLastSyncedAt(Date.now());
+    try {
+      setPushingId('all');
+      const syncOptions = await buildRecordingSyncOptions(logs);
+      const result = await pushCallsToPortal(logs, syncOptions);
+      if (result.success) {
+        setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
+        await setLastSyncedAt(Date.now());
+      }
+      Alert.alert(result.success ? 'Sent' : 'Error', result.message);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to push calls';
+      Alert.alert('Error', msg);
+    } finally {
+      setPushingId(null);
     }
-    Alert.alert(result.success ? 'Sent' : 'Error', result.message);
   }, [logs]);
 
   const handleOpenSettings = () => {
