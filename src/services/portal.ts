@@ -1,6 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
 import RNFS from 'react-native-fs';
+import { enrichCallLogsWithContactNames } from './callLogNames';
 
 /** Portal API URL – set in code; not configurable in Settings. */
 const PORTAL_API_URL = 'https://leadtracker.gaincafe.com/api/call-logs/sync';
@@ -96,7 +97,8 @@ export interface SyncOptions {
   recordingsByCallId?: Record<string, RecordingPayload[]>;
 }
 
-function toCalledAt(c: CallLog): string {
+/** Same string as log `called_at` in sync payload — use for `recorded_at` on recordings. */
+export function toCalledAt(c: CallLog): string {
   const rawTs = typeof c.timestamp === 'string' ? Number(c.timestamp) : c.timestamp;
   const ts = Number.isFinite(rawTs)
     ? (rawTs as number) > 1e12
@@ -282,6 +284,8 @@ export async function pushCallsToPortal(
   options: SyncOptions = {}
 ): Promise<PushResult> {
   try {
+    // Dialer often shows a name while CallLogs.load() leaves name empty; fill from contacts when allowed.
+    const callsForPayload = await enrichCallLogsWithContactNames(calls);
     const deviceInfo = await getDeviceInfo();
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -290,7 +294,7 @@ export async function pushCallsToPortal(
     if (CALL_LOG_APP_KEY) headers['X-App-Key'] = CALL_LOG_APP_KEY;
     if (AUTHORIZATION) headers.Authorization = AUTHORIZATION;
 
-    const logsBase = await Promise.all(calls.map(async (c) => {
+    const logsBase = await Promise.all(callsForPayload.map(async (c) => {
       const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
       const recordings = toRecordingArray(options.recordingsByCallId?.[c.id]);
       // Send a single unified recordings[] array to avoid duplicate payload forms.
@@ -349,8 +353,9 @@ export async function pushCallsToPortal(
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
       sentAt: new Date().toISOString(),
     };
+    // Normal when no files matched / no local recordings — only noisy as a warning.
     if (!payload.logs.some((l) => (l as { recordings?: unknown[] }).recordings?.length)) {
-      console.warn('[sync-payload] no recordings attached in this batch');
+      console.log('[sync-payload] no recordings attached in this batch (call logs only)');
     }
     const logsWithRecordings = payload.logs.filter((l) => (l as { recordings?: unknown[] }).recordings?.length).length;
     const totalRecordingItems = payload.logs.reduce((acc, l) => {
@@ -392,7 +397,7 @@ export async function pushCallsToPortal(
     if (firstWithRecordings) {
       console.log('[sync-payload] sample with recordings =', firstWithRecordings);
     } else {
-      console.warn('[sync-payload] no non-empty recordings item found before /sync');
+      console.log('[sync-payload] no non-empty recordings before /sync (expected if batch has no matched files)');
     }
     console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
     const controller = new AbortController();
@@ -415,8 +420,8 @@ export async function pushCallsToPortal(
         : `Portal responded with ${res.status}`;
       return { success: false, message: msg };
     }
-    let apiMessage = `${calls.length} call(s) pushed to portal.`;
-    let savedCount = calls.length;
+    let apiMessage = `${callsForPayload.length} call(s) pushed to portal.`;
+    let savedCount = callsForPayload.length;
     let results: PushResult['results'];
     try {
       const json = (await res.json()) as {

@@ -1,6 +1,6 @@
 import RNFS from 'react-native-fs';
 import type { CallLog } from 'react-native-call-log';
-import type { SyncOptions } from './portal';
+import { toCalledAt, type SyncOptions } from './portal';
 
 const AUDIO_EXT_RE = /\.(mp3|m4a|aac|amr|wav|ogg|3gp)$/i;
 const STRICT_MATCH_WINDOW_MS = 30 * 60 * 1000; // 30 minutes
@@ -19,11 +19,6 @@ function callTimeMs(c: CallLog): number {
     if (Number.isFinite(d)) return d;
   }
   return 0;
-}
-
-function toRecordedAt(ms: number): string {
-  const d = new Date(ms);
-  return d.toISOString().slice(0, 19).replace('T', ' ');
 }
 
 function escapeRegExp(s: string): string {
@@ -170,12 +165,13 @@ export async function buildRecordingSyncOptions(calls: CallLog[]): Promise<SyncO
 
       if (matches.length > 0) {
         matches.forEach((m) => usedPaths.add(m.path));
+        const calledAt = toCalledAt(c);
         recordingsByCallId[c.id] = matches.map((m) => ({
           recording_url: `file://${m.path}`,
           recording_external_id: `${m.name}:${c.id}`,
           duration_seconds: c.duration > 0 ? c.duration : undefined,
           source: 'mobile_app',
-          recorded_at: toRecordedAt(m.mtimeMs),
+          recorded_at: calledAt,
         }));
       }
     }
