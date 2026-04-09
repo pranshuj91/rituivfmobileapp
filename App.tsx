@@ -1,10 +1,11 @@
 /**
  * Ritu IVF Mobile App – Bottom navigation, call logs, push to portal.
- * Scheduled sync runs every 3 hours and when app becomes active (if 3+ hours since last sync).
+ * Scheduled sync runs every 30 minutes and when app becomes active.
  */
 
 import React, { useEffect, useRef } from 'react';
 import { AppState, AppStateStatus, StatusBar } from 'react-native';
+import BackgroundFetch from 'react-native-background-fetch';
 import { runScheduledSync, shouldRunSyncNow } from './src/services/syncSchedule';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -33,22 +34,23 @@ function TabIcon({
   );
 }
 
-const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+const BACKGROUND_FETCH_INTERVAL_MINUTES = 30;
 
 export default function App() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
 
   useEffect(() => {
-    // Run sync once shortly after launch if 3+ hours since last sync (or never synced)
+    // Run sync once shortly after launch if threshold passed (or never synced)
     const t = setTimeout(() => {
       shouldRunSyncNow().then((ok) => {
         if (ok) runScheduledSync();
       });
     }, 2000);
 
-    // Every 3 hours while app is in memory
-    intervalRef.current = setInterval(runScheduledSync, THREE_HOURS_MS);
+    // Every 30 minutes while app is in memory
+    intervalRef.current = setInterval(runScheduledSync, THIRTY_MINUTES_MS);
 
     const sub = AppState.addEventListener('change', (nextState) => {
       const becameActive =
@@ -66,6 +68,32 @@ export default function App() {
       if (intervalRef.current) clearInterval(intervalRef.current);
       sub.remove();
     };
+  }, []);
+
+  useEffect(() => {
+    // Native background scheduler (Android WorkManager/JobScheduler).
+    // This can run even when app is not foregrounded.
+    BackgroundFetch.configure(
+      {
+        minimumFetchInterval: BACKGROUND_FETCH_INTERVAL_MINUTES,
+        stopOnTerminate: false,
+        startOnBoot: true,
+        enableHeadless: true,
+        requiredNetworkType: BackgroundFetch.NETWORK_TYPE_ANY,
+      },
+      async (taskId) => {
+        try {
+          await runScheduledSync();
+        } finally {
+          BackgroundFetch.finish(taskId);
+        }
+      },
+      (taskId) => {
+        BackgroundFetch.finish(taskId);
+      }
+    ).catch(() => {
+      // Keep app running even if background fetch init fails.
+    });
   }, []);
 
   return (

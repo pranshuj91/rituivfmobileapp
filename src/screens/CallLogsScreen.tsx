@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -11,11 +11,17 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useFocusEffect } from '@react-navigation/native';
 import Icon from 'react-native-vector-icons/MaterialCommunityIcons';
 import CallLogs from 'react-native-call-log';
 import type { CallLog } from 'react-native-call-log';
 import { enrichCallLogsWithContactNames } from '../services/callLogNames';
-import { pushCallsToPortal, pushSingleCallToPortal, setLastSyncedAt } from '../services/portal';
+import {
+  getLastSyncedAt,
+  pushCallsToPortal,
+  pushSingleCallToPortal,
+  setLastSyncedAt,
+} from '../services/portal';
 import { buildRecordingSyncOptions } from '../services/recordings';
 import { theme } from '../theme';
 
@@ -29,6 +35,7 @@ const CALL_LOG_PERMISSIONS = [
     ? [PermissionsAndroid.PERMISSIONS.READ_PHONE_NUMBERS]
     : []),
 ];
+const AUTO_REFRESH_MS = 60 * 1000;
 
 function formatDuration(seconds: number): string {
   if (seconds < 0) return '—';
@@ -42,6 +49,11 @@ interface CallLogItemProps {
   onPush: (call: CallLog) => void;
   pushing: boolean;
   synced: boolean;
+}
+
+function formatLastSync(ms: number | null): string {
+  if (!ms) return 'Last sync: never';
+  return `Last sync: ${new Date(ms).toLocaleString()}`;
 }
 
 function CallLogItemRow({ item, onPush, pushing, synced }: CallLogItemProps) {
@@ -88,12 +100,27 @@ function CallLogItemRow({ item, onPush, pushing, synced }: CallLogItemProps) {
 
 export function CallLogsScreen() {
   const insets = useSafeAreaInsets();
+  const loadingRef = useRef(false);
   const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
   const [logs, setLogs] = useState<CallLog[]>([]);
   const [loading, setLoading] = useState(false);
   const [pushingId, setPushingId] = useState<string | 'all' | null>(null);
   const [syncedIds, setSyncedIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [lastSyncedAtMs, setLastSyncedAtMs] = useState<number | null>(null);
+
+  const refreshLastSync = useCallback(async () => {
+    const last = await getLastSyncedAt();
+    setLastSyncedAtMs(last);
+  }, []);
+
+  useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
+    refreshLastSync();
+  }, [refreshLastSync]);
 
   const requestPermissions = useCallback(async () => {
     if (Platform.OS !== 'android') {
@@ -122,20 +149,35 @@ export function CallLogsScreen() {
     }
   }, []);
 
-  const loadCallLogs = useCallback(async () => {
+  const loadCallLogs = useCallback(async (silent = false) => {
     if (Platform.OS !== 'android') return;
-    setLoading(true);
-    setError(null);
+    if (loadingRef.current) return;
+    if (!silent) setLoading(true);
+    if (!silent) setError(null);
     try {
       const list = await CallLogs.load(100);
       setLogs(await enrichCallLogsWithContactNames(list));
+      await refreshLastSync();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load call logs');
-      setLogs([]);
+      if (!silent) {
+        setError(e instanceof Error ? e.message : 'Failed to load call logs');
+        setLogs([]);
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  }, []);
+  }, [refreshLastSync]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (permissionGranted !== true) return undefined;
+      loadCallLogs(true);
+      const id = setInterval(() => {
+        loadCallLogs(true);
+      }, AUTO_REFRESH_MS);
+      return () => clearInterval(id);
+    }, [permissionGranted, loadCallLogs])
+  );
 
   const handlePushOne = useCallback(async (call: CallLog) => {
     try {
@@ -144,7 +186,9 @@ export function CallLogsScreen() {
       const result = await pushSingleCallToPortal(call, syncOptions);
       if (result.success) {
         setSyncedIds((prev) => new Set([...prev, call.id]));
-        await setLastSyncedAt(Date.now());
+        const now = Date.now();
+        await setLastSyncedAt(now);
+        setLastSyncedAtMs(now);
       }
       Alert.alert(result.success ? 'Sent' : 'Error', result.message);
     } catch (e) {
@@ -166,7 +210,9 @@ export function CallLogsScreen() {
       const result = await pushCallsToPortal(logs, syncOptions);
       if (result.success) {
         setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
-        await setLastSyncedAt(Date.now());
+        const now = Date.now();
+        await setLastSyncedAt(now);
+        setLastSyncedAtMs(now);
       }
       Alert.alert(result.success ? 'Sent' : 'Error', result.message);
     } catch (e) {
@@ -201,6 +247,7 @@ export function CallLogsScreen() {
       <View style={styles.header}>
         <Text style={styles.title}>Call logs</Text>
         <Text style={styles.subtitle}>Load and push to portal</Text>
+        <Text style={styles.lastSyncText}>{formatLastSync(lastSyncedAtMs)}</Text>
       </View>
 
       {permissionGranted === null && (
@@ -225,7 +272,7 @@ export function CallLogsScreen() {
           <View style={styles.actionRow}>
             <TouchableOpacity
               style={styles.secondaryButton}
-              onPress={loadCallLogs}
+              onPress={() => loadCallLogs(false)}
               disabled={loading}
             >
               {loading ? (
@@ -316,6 +363,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: theme.colors.textSecondary,
     marginTop: theme.spacing.xs,
+  },
+  lastSyncText: {
+    fontSize: 12,
+    color: theme.colors.tabInactive,
+    marginTop: 4,
   },
   primaryButton: {
     flexDirection: 'row',

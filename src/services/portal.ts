@@ -1,15 +1,18 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
 import RNFS from 'react-native-fs';
+import Config from 'react-native-config';
 import { enrichCallLogsWithContactNames } from './callLogNames';
 
 /** Portal API URL – set in code; not configurable in Settings. */
-const PORTAL_API_URL = 'https://leadtracker.gaincafe.com/api/call-logs/sync';
-const RECORDING_UPLOAD_URL = 'https://leadtracker.gaincafe.com/api/call-logs/upload-recording';
+const PORTAL_API_URL =
+  Config.CALL_LOG_SYNC_URL || 'https://leadtracker.gaincafe.com/api/call-logs/sync';
+const RECORDING_UPLOAD_URL =
+  Config.CALL_LOG_UPLOAD_URL || 'https://leadtracker.gaincafe.com/api/call-logs/upload-recording';
 
 /** Optional: set in code if your backend requires these headers. */
-const CALL_LOG_APP_KEY = ''; // e.g. 'your-app-key'
-const AUTHORIZATION = ''; // e.g. 'Bearer token'
+const CALL_LOG_APP_KEY = Config.CALL_LOG_APP_KEY || '';
+const AUTHORIZATION = Config.CALL_LOG_AUTHORIZATION || ''; // e.g. 'Bearer token'
 
 const DEVICE_NAME_KEY = '@ritu_device_name';
 const DEVICE_PHONE_KEY = '@ritu_device_phone';
@@ -169,6 +172,25 @@ function toMsFromCalledAt(value?: unknown): number {
   return Number.isFinite(t) ? t : 0;
 }
 
+function getCallTimeMs(c: CallLog): number {
+  const rawTs = typeof c.timestamp === 'string' ? Number(c.timestamp) : c.timestamp;
+  if (Number.isFinite(rawTs)) {
+    return (rawTs as number) > 1e12 ? (rawTs as number) : (rawTs as number) * 1000;
+  }
+  if (c.dateTime) {
+    const t = Date.parse(c.dateTime);
+    if (Number.isFinite(t)) return t;
+  }
+  return 0;
+}
+
+function callIdFromRecordingExternalId(externalId?: unknown): string {
+  const ext = String(externalId ?? '');
+  const idx = ext.lastIndexOf(':');
+  if (idx < 0) return '';
+  return ext.slice(idx + 1).trim();
+}
+
 function strictRecordingMatchesCall(recording: Record<string, unknown>, log: Record<string, unknown>): boolean {
   const recExtId = String(recording.recording_external_id ?? '');
   const callId = String(log.callId ?? log.id ?? '');
@@ -286,6 +308,7 @@ export async function pushCallsToPortal(
   try {
     // Dialer often shows a name while CallLogs.load() leaves name empty; fill from contacts when allowed.
     const callsForPayload = await enrichCallLogsWithContactNames(calls);
+    const currentCallIds = new Set(callsForPayload.map((c) => String(c.id)));
     const deviceInfo = await getDeviceInfo();
     const headers: Record<string, string> = {
       Accept: 'application/json',
@@ -298,7 +321,12 @@ export async function pushCallsToPortal(
       const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
       const recordings = toRecordingArray(options.recordingsByCallId?.[c.id]);
       // Send a single unified recordings[] array to avoid duplicate payload forms.
-      const mergedRecordingsRaw = recordings ?? (Object.keys(singleRec).length > 0 ? [singleRec] : []);
+      const mergedRecordingsRawAll = recordings ?? (Object.keys(singleRec).length > 0 ? [singleRec] : []);
+      const mergedRecordingsRaw = mergedRecordingsRawAll.filter((r) => {
+        const recCallId = callIdFromRecordingExternalId(r.recording_external_id);
+        // Upload only candidates whose :callId belongs to current sync batch.
+        return !!recCallId && recCallId === String(c.id) && currentCallIds.has(recCallId);
+      });
       const calledAt = toCalledAt(c);
       await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id)));
       const phoneNumber = c.phoneNumber || c.formattedNumber || '';
@@ -318,18 +346,47 @@ export async function pushCallsToPortal(
       (acc, list) => acc + list.length,
       0
     );
+    const currentLogCallIds = new Set(
+      logsBase.map((l) => String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''))
+    );
+
+    const requestedRecordingsByCallId = new Map<string, number>();
+    callsForPayload.forEach((c) => {
+      const list = options.recordingsByCallId?.[c.id] ?? [];
+      const one = options.singleRecordingByCallId?.[c.id];
+      const all = [...list, ...(one ? [one] : [])];
+      const filtered = all.filter((r) => {
+        const recCallId = callIdFromRecordingExternalId(r.recording_external_id ?? r.external_id);
+        return !!recCallId && recCallId === String(c.id) && currentCallIds.has(recCallId);
+      });
+      requestedRecordingsByCallId.set(String(c.id), filtered.length);
+    });
+    const latestCall = [...callsForPayload].sort((a, b) => getCallTimeMs(b) - getCallTimeMs(a))[0];
+    const latestCallId = latestCall ? String(latestCall.id) : '';
+    const latestCallRequestedRecordings = latestCallId ? (requestedRecordingsByCallId.get(latestCallId) ?? 0) : 0;
 
     // Merge uploaded recordings into logs[] by callId.
     const usedExternalIds = new Set<string>();
     const usedRecordingUrls = new Set<string>();
     const logs = logsBase.map((log) => {
-      const recsForCall = uploadedRecordingsByCallId.get(String(log.callId)) ?? [];
+      const callId = String(log.callId ?? log.id ?? '');
+      const recsForCall = uploadedRecordingsByCallId.get(callId) ?? [];
       const recs = recsForCall.filter((r) => {
         const extId = String(r.recording_external_id ?? '');
+        const extCallId = callIdFromRecordingExternalId(extId);
         const recUrl = String(r.recording_url ?? '');
+        // Keep recording only when external id has ":<callId>" and this callId is in current batch.
+        if (!extCallId || extCallId !== callId || !currentLogCallIds.has(extCallId)) {
+          console.warn('[recording-skip] out-of-batch-or-mismatch', {
+            callId,
+            extCallId,
+            recording_external_id: extId,
+          });
+          return false;
+        }
         if (!strictRecordingMatchesCall(r, log as Record<string, unknown>)) {
           console.warn('[recording-skip] strict mismatch', {
-            callId: String(log.callId ?? log.id ?? ''),
+            callId,
             phone: String(log.phone_number ?? ''),
             recording_external_id: extId,
           });
@@ -362,20 +419,21 @@ export async function pushCallsToPortal(
       const n = (l as { recordings?: unknown[] }).recordings?.length ?? 0;
       return acc + n;
     }, 0);
-    const samplePairs = payload.logs.slice(0, 2).flatMap((l) => {
+    const samplePairs = payload.logs.flatMap((l) => {
       const recs = (l as { recordings?: Array<Record<string, unknown>> }).recordings ?? [];
       return recs.slice(0, 1).map((r) => ({
         callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
         phone: String((l as Record<string, unknown>).phone_number ?? ''),
         recording_external_id: String(r.recording_external_id ?? ''),
       }));
-    });
+    }).slice(0, 5);
     const first2Compact = payload.logs.slice(0, 2).map((l) => ({
       callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
       recordingsLength: ((l as { recordings?: unknown[] }).recordings?.length ?? 0),
     }));
     console.log('[sync-payload] totals', {
       totalLogs: payload.logs.length,
+      currentCallIdsSize: currentLogCallIds.size,
       logsWithRecordings,
       totalRecordingItems,
       uploadSucceededCount,
@@ -387,6 +445,23 @@ export async function pushCallsToPortal(
       return {
         success: false,
         message: 'Recording upload succeeded, but merged sync payload has 0 recordings. Sync blocked.',
+      };
+    }
+    const latestCallLogEntry = latestCallId
+      ? payload.logs.find(
+        (l) => String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? '') === latestCallId
+      ) as { recordings?: unknown[] } | undefined
+      : undefined;
+    const latestCallPayloadRecordings = latestCallLogEntry?.recordings?.length ?? 0;
+    if (latestCallRequestedRecordings > 0 && latestCallPayloadRecordings === 0) {
+      console.error('[sync-block] latest call expected recording but payload has none', {
+        latestCallId,
+        latestCallRequestedRecordings,
+        latestCallPayloadRecordings,
+      });
+      return {
+        success: false,
+        message: 'Latest call has recording candidate, but payload recordings are empty. Sync blocked.',
       };
     }
     console.log('[sync-payload] logs[0].recordings?.length =', (payload.logs[0] as { recordings?: unknown[] } | undefined)?.recordings?.length ?? 0);
