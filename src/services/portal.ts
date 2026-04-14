@@ -21,6 +21,7 @@ const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
 const UPLOAD_TIMEOUT_MS = 25 * 1000;
 const SYNC_TIMEOUT_MS = 35 * 1000;
+let syncRequestInFlight = false;
 
 export interface DeviceInfo {
   deviceName: string;
@@ -305,6 +306,14 @@ export async function pushCallsToPortal(
   calls: CallLog[],
   options: SyncOptions = {}
 ): Promise<PushResult> {
+  if (syncRequestInFlight) {
+    console.log('[sync-lock] skipped duplicate sync request', { callCount: calls.length });
+    return {
+      success: false,
+      message: 'Sync already in progress. Please wait a few seconds and try again.',
+    };
+  }
+  syncRequestInFlight = true;
   try {
     // Dialer often shows a name while CallLogs.load() leaves name empty; fill from contacts when allowed.
     const callsForPayload = await enrichCallLogsWithContactNames(calls);
@@ -525,6 +534,7 @@ export async function pushCallsToPortal(
   } finally {
     // Keep map until sync call has executed, then clear.
     uploadedRecordingsByCallId.clear();
+    syncRequestInFlight = false;
   }
 }
 

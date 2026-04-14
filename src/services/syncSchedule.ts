@@ -23,6 +23,7 @@ import { buildRecordingSyncOptions } from './recordings';
 const BATCH_LIMIT = 100;
 const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 const RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+let scheduledSyncInFlight = false;
 
 function getCallTimeMs(c: CallLog): number {
   if (typeof c.timestamp === 'number') {
@@ -60,6 +61,11 @@ async function isNetworkConnected(): Promise<boolean> {
  */
 export async function runScheduledSync(): Promise<void> {
   if (Platform.OS !== 'android') return;
+  if (scheduledSyncInFlight) {
+    console.log('[auto-sync] skipped: scheduled sync already running');
+    return;
+  }
+  scheduledSyncInFlight = true;
 
   try {
     if (!(await isNetworkConnected())) return;
@@ -86,6 +92,8 @@ export async function runScheduledSync(): Promise<void> {
     }
   } catch {
     // Skip this run; next run will retry.
+  } finally {
+    scheduledSyncInFlight = false;
   }
 }
 
