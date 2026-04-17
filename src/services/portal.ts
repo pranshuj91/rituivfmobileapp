@@ -18,10 +18,16 @@ const DEVICE_NAME_KEY = '@ritu_device_name';
 const DEVICE_PHONE_KEY = '@ritu_device_phone';
 const LAST_SYNCED_AT_KEY = '@ritu_last_synced_at';
 const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
+const uploadedRecordingUrlByExternalId = new Map<string, string>();
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
 const UPLOAD_TIMEOUT_MS = 25 * 1000;
-const SYNC_TIMEOUT_MS = 35 * 1000;
+const SYNC_TIMEOUT_MS = 60 * 1000;
+const DUPLICATE_SYNC_WINDOW_MS = 30 * 1000;
+const SAME_LOGS_RECORDING_DROP_WINDOW_MS = 2 * 60 * 1000;
 let syncRequestInFlight = false;
+let lastSyncSignature = '';
+let lastSyncAtMs = 0;
+let lastSyncRecordingItems = 0;
 
 export interface DeviceInfo {
   deviceName: string;
@@ -224,6 +230,29 @@ async function uploadRecordingIfNeeded(
   callId: string
 ): Promise<Record<string, unknown> | null> {
   const rawUrl = typeof recording.recording_url === 'string' ? recording.recording_url : '';
+  const externalId = String(recording.recording_external_id ?? '');
+  // Reuse already uploaded URL for same stable recording_external_id.
+  // This avoids repeated uploads across retries/auto-runs in same app session.
+  if (externalId) {
+    const cachedUrl = uploadedRecordingUrlByExternalId.get(externalId);
+    if (cachedUrl) {
+      const cached: Record<string, unknown> = {
+        ...recording,
+        recording_url: cachedUrl,
+      };
+      const list = uploadedRecordingsByCallId.get(callId) ?? [];
+      list.push({
+        recording_url: cachedUrl,
+        recording_external_id: externalId,
+        duration_seconds: recording.duration_seconds,
+        source: recording.source,
+        recorded_at: recording.recorded_at,
+        __uploaded_for_call_id: callId,
+      });
+      uploadedRecordingsByCallId.set(callId, list);
+      return cached;
+    }
+  }
   if (!rawUrl) return recording;
   if (!rawUrl.startsWith('file://')) return recording;
   if (!RECORDING_UPLOAD_URL) return null;
@@ -280,6 +309,9 @@ async function uploadRecordingIfNeeded(
     }
 
     if (!uploadedUrl) return null;
+    if (externalId) {
+      uploadedRecordingUrlByExternalId.set(externalId, uploadedUrl);
+    }
     const uploaded: Record<string, unknown> = {
       ...recording,
       recording_url: uploadedUrl,
@@ -377,6 +409,12 @@ export async function pushCallsToPortal(
     // Merge uploaded recordings into logs[] by callId.
     const usedExternalIds = new Set<string>();
     const usedRecordingUrls = new Set<string>();
+    const dropReasonCounts: Record<string, number> = {
+      outOfBatchOrMismatch: 0,
+      strictMismatch: 0,
+      duplicateExternalId: 0,
+      duplicateRecordingUrl: 0,
+    };
     const logs = logsBase.map((log) => {
       const callId = String(log.callId ?? log.id ?? '');
       const recsForCall = uploadedRecordingsByCallId.get(callId) ?? [];
@@ -386,6 +424,7 @@ export async function pushCallsToPortal(
         const recUrl = String(r.recording_url ?? '');
         // Keep recording only when external id has ":<callId>" and this callId is in current batch.
         if (!extCallId || extCallId !== callId || !currentLogCallIds.has(extCallId)) {
+          dropReasonCounts.outOfBatchOrMismatch += 1;
           console.warn('[recording-skip] out-of-batch-or-mismatch', {
             callId,
             extCallId,
@@ -394,6 +433,7 @@ export async function pushCallsToPortal(
           return false;
         }
         if (!strictRecordingMatchesCall(r, log as Record<string, unknown>)) {
+          dropReasonCounts.strictMismatch += 1;
           console.warn('[recording-skip] strict mismatch', {
             callId,
             phone: String(log.phone_number ?? ''),
@@ -401,8 +441,23 @@ export async function pushCallsToPortal(
           });
           return false;
         }
-        if (extId && usedExternalIds.has(extId)) return false;
-        if (recUrl && usedRecordingUrls.has(recUrl)) return false;
+        if (extId && usedExternalIds.has(extId)) {
+          dropReasonCounts.duplicateExternalId += 1;
+          console.warn('[recording-skip] duplicate external id', {
+            callId,
+            recording_external_id: extId,
+          });
+          return false;
+        }
+        if (recUrl && usedRecordingUrls.has(recUrl)) {
+          dropReasonCounts.duplicateRecordingUrl += 1;
+          console.warn('[recording-skip] duplicate recording url', {
+            callId,
+            recording_url: recUrl,
+            recording_external_id: extId,
+          });
+          return false;
+        }
         if (extId) usedExternalIds.add(extId);
         if (recUrl) usedRecordingUrls.add(recUrl);
         return true;
@@ -440,12 +495,52 @@ export async function pushCallsToPortal(
       callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
       recordingsLength: ((l as { recordings?: unknown[] }).recordings?.length ?? 0),
     }));
+    const syncSignature = payload.logs
+      .map((l) => {
+        const callId = String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? '');
+        const calledAt = String((l as Record<string, unknown>).called_at ?? '');
+        return `${callId}|${calledAt}`;
+      })
+      .join('||');
+    const nowMs = Date.now();
+    if (
+      lastSyncSignature &&
+      syncSignature === lastSyncSignature &&
+      nowMs - lastSyncAtMs <= DUPLICATE_SYNC_WINDOW_MS
+    ) {
+      console.warn('[sync-block] duplicate payload in short window', {
+        duplicateWithinMs: nowMs - lastSyncAtMs,
+        totalLogs: payload.logs.length,
+      });
+      return {
+        success: false,
+        message: 'Duplicate sync payload detected. Skipping immediate re-send.',
+      };
+    }
+    if (
+      lastSyncSignature &&
+      syncSignature === lastSyncSignature &&
+      lastSyncRecordingItems > 0 &&
+      totalRecordingItems === 0 &&
+      nowMs - lastSyncAtMs <= SAME_LOGS_RECORDING_DROP_WINDOW_MS
+    ) {
+      console.error('[sync-block] same logs re-sent with recordings dropped', {
+        previousRecordingItems: lastSyncRecordingItems,
+        currentRecordingItems: totalRecordingItems,
+        withinMs: nowMs - lastSyncAtMs,
+      });
+      return {
+        success: false,
+        message: 'Same logs re-sent without recordings soon after previous sync. Sync blocked.',
+      };
+    }
     console.log('[sync-payload] totals', {
       totalLogs: payload.logs.length,
       currentCallIdsSize: currentLogCallIds.size,
       logsWithRecordings,
       totalRecordingItems,
       uploadSucceededCount,
+      dropReasonCounts,
       samplePairs,
       first2Compact,
     });
@@ -522,6 +617,9 @@ export async function pushCallsToPortal(
     } catch {
       // Keep fallback success message
     }
+    lastSyncSignature = syncSignature;
+    lastSyncAtMs = Date.now();
+    lastSyncRecordingItems = totalRecordingItems;
     return { success: true, message: apiMessage, count: savedCount, results };
   } catch (e) {
     const isAbort = e instanceof Error && e.name === 'AbortError';
