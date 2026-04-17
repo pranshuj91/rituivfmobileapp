@@ -17,6 +17,8 @@ const AUTHORIZATION = Config.CALL_LOG_AUTHORIZATION || ''; // e.g. 'Bearer token
 const DEVICE_NAME_KEY = '@ritu_device_name';
 const DEVICE_PHONE_KEY = '@ritu_device_phone';
 const LAST_SYNCED_AT_KEY = '@ritu_last_synced_at';
+const PENDING_SYNC_BATCHES_KEY = '@ritu_pending_sync_batches';
+const FAILED_SYNC_BATCHES_KEY = '@ritu_failed_sync_batches';
 const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
 const uploadedRecordingUrlByExternalId = new Map<string, string>();
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
@@ -24,10 +26,47 @@ const UPLOAD_TIMEOUT_MS = 25 * 1000;
 const SYNC_TIMEOUT_MS = 60 * 1000;
 const DUPLICATE_SYNC_WINDOW_MS = 30 * 1000;
 const SAME_LOGS_RECORDING_DROP_WINDOW_MS = 2 * 60 * 1000;
+const MAX_PENDING_SYNC_BATCHES = 96;
+const MAX_FAILED_SYNC_BATCHES = 200;
+const MAX_BATCH_ATTEMPTS = 16;
+const RETRY_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
+const EVICTED_BATCH_RETRY_DELAY_MS = 30 * 60 * 1000;
 let syncRequestInFlight = false;
 let lastSyncSignature = '';
 let lastSyncAtMs = 0;
 let lastSyncRecordingItems = 0;
+
+interface SyncPayloadLog {
+  id: string;
+  callId: string;
+  phone_number: string;
+  name: string;
+  direction: string;
+  duration_seconds: number;
+  called_at: string;
+  recordings: Array<Record<string, unknown>>;
+}
+
+interface SyncPayload {
+  logs: SyncPayloadLog[];
+  deviceName?: string;
+  devicePhone?: string;
+  sentAt: string;
+}
+
+interface PendingSyncBatch {
+  id: string;
+  signature: string;
+  priority: 'high' | 'normal';
+  recordingItems: number;
+  createdAt: number;
+  attempts: number;
+  nextRetryAt: number;
+  lastError?: string;
+  payload: SyncPayload;
+}
+
+export type SyncMode = 'manual' | 'auto';
 
 export interface DeviceInfo {
   deviceName: string;
@@ -72,6 +111,318 @@ export async function getLastSyncedAt(): Promise<number | null> {
 
 export async function setLastSyncedAt(ms: number): Promise<void> {
   await AsyncStorage.setItem(LAST_SYNCED_AT_KEY, String(ms));
+}
+
+async function getPendingSyncBatches(): Promise<PendingSyncBatch[]> {
+  try {
+    const raw = await AsyncStorage.getItem(PENDING_SYNC_BATCHES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PendingSyncBatch[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+async function setPendingSyncBatches(batches: PendingSyncBatch[]): Promise<void> {
+  await AsyncStorage.setItem(PENDING_SYNC_BATCHES_KEY, JSON.stringify(batches));
+}
+
+async function getFailedSyncBatches(): Promise<PendingSyncBatch[]> {
+  try {
+    const raw = await AsyncStorage.getItem(FAILED_SYNC_BATCHES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as PendingSyncBatch[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+async function setFailedSyncBatches(batches: PendingSyncBatch[]): Promise<void> {
+  await AsyncStorage.setItem(FAILED_SYNC_BATCHES_KEY, JSON.stringify(batches));
+}
+
+async function moveBatchToFailedArchive(batch: PendingSyncBatch): Promise<void> {
+  const existing = await getFailedSyncBatches();
+  if (existing.some((b) => b.id === batch.id)) return;
+  const next = [...existing, batch];
+  const capped = next.length > MAX_FAILED_SYNC_BATCHES
+    ? next.slice(next.length - MAX_FAILED_SYNC_BATCHES)
+    : next;
+  await setFailedSyncBatches(capped);
+}
+
+async function requeueDueFailedBatches(): Promise<void> {
+  const now = Date.now();
+  const [pending, failed] = await Promise.all([
+    getPendingSyncBatches(),
+    getFailedSyncBatches(),
+  ]);
+  if (failed.length === 0) return;
+
+  const pendingIds = new Set(pending.map((b) => b.id));
+  const dueFailed = failed.filter((b) => b.nextRetryAt <= now && !pendingIds.has(b.id));
+  if (dueFailed.length === 0) return;
+
+  const availableSlots = Math.max(0, MAX_PENDING_SYNC_BATCHES - pending.length);
+  if (availableSlots === 0) return;
+
+  const toRequeue = dueFailed
+    .sort((a, b) => a.nextRetryAt - b.nextRetryAt)
+    .slice(0, availableSlots)
+    .map((b) => ({
+      ...b,
+      nextRetryAt: now,
+      lastError: `${b.lastError ?? 'recovered'} (requeued from failed archive)`,
+    }));
+
+  if (toRequeue.length === 0) return;
+
+  const requeueIds = new Set(toRequeue.map((b) => b.id));
+  const remainingFailed = failed.filter((b) => !requeueIds.has(b.id));
+  await Promise.all([
+    setPendingSyncBatches([...pending, ...toRequeue]),
+    setFailedSyncBatches(remainingFailed),
+  ]);
+}
+
+function makeBatchId(): string {
+  return `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function hashSignature(input: string): string {
+  let h = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    h = (h * 31 + input.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function makeDeterministicBatchId(signature: string): string {
+  return `batch-${hashSignature(signature)}`;
+}
+
+function retryDelayForAttempt(attempts: number): number {
+  const idx = Math.max(0, Math.min(attempts, RETRY_BACKOFF_MS.length - 1));
+  return RETRY_BACKOFF_MS[idx];
+}
+
+async function enqueuePendingSyncBatch(batch: PendingSyncBatch): Promise<void> {
+  await requeueDueFailedBatches();
+  const existing = await getPendingSyncBatches();
+  // BatchId dedupe: same logical payload should not enqueue twice.
+  if (existing.some((b) => b.id === batch.id)) return;
+  const next = batch.priority === 'high'
+    ? [batch, ...existing]
+    : [...existing, batch];
+  // Queue limit:
+  // - for high priority manual batch, always keep the new head and trim from tail
+  // - for normal batch, keep newest N batches
+  let capped = next;
+  if (next.length > MAX_PENDING_SYNC_BATCHES) {
+    capped = batch.priority === 'high'
+      ? [next[0], ...next.slice(1, MAX_PENDING_SYNC_BATCHES)]
+      : next.slice(next.length - MAX_PENDING_SYNC_BATCHES);
+    const keptIds = new Set(capped.map((b) => b.id));
+    const evicted = next.filter((b) => !keptIds.has(b.id));
+    await Promise.all(
+      evicted.map((e) => moveBatchToFailedArchive({
+        ...e,
+        nextRetryAt: Date.now() + EVICTED_BATCH_RETRY_DELAY_MS,
+        lastError: `${e.lastError ?? 'queue limit'} (evicted from pending queue)`,
+      }))
+    );
+  }
+  await setPendingSyncBatches(capped);
+}
+
+async function postSyncPayload(
+  payload: SyncPayload,
+  headers: Record<string, string>
+): Promise<{
+  ok: boolean;
+  message: string;
+  count?: number;
+  results?: PushResult['results'];
+}> {
+  const controller = new AbortController();
+  const syncTimeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
+  const res = await fetch(PORTAL_API_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+    signal: controller.signal,
+  }).finally(() => clearTimeout(syncTimeout));
+  if (!res.ok) {
+    let details = '';
+    try {
+      details = await res.text();
+    } catch {
+      details = '';
+    }
+    const msg = details
+      ? `Portal responded with ${res.status}: ${details}`
+      : `Portal responded with ${res.status}`;
+    return { ok: false, message: msg };
+  }
+  let apiMessage = `${payload.logs.length} call(s) pushed to portal.`;
+  let savedCount = payload.logs.length;
+  let results: PushResult['results'];
+  try {
+    const json = (await res.json()) as {
+      message?: string;
+      saved?: number;
+      results?: PushResult['results'];
+    };
+    if (json.message) apiMessage = json.message;
+    if (typeof json.saved === 'number') savedCount = json.saved;
+    if (Array.isArray(json.results)) {
+      results = json.results;
+      savedCount = json.results.length;
+    }
+  } catch {
+    // Keep fallback success message
+  }
+  return { ok: true, message: apiMessage, count: savedCount, results };
+}
+
+async function flushPendingSyncBatches(
+  headers: Record<string, string>
+): Promise<PushResult> {
+  await requeueDueFailedBatches();
+  let batches = await getPendingSyncBatches();
+  if (batches.length === 0) {
+    return { success: true, message: 'No pending sync batch.' };
+  }
+
+  let lastSuccess: PushResult = {
+    success: true,
+    message: 'Synced pending batches successfully.',
+  };
+  let processedAny = false;
+  let progressed = true;
+  while (batches.length > 0 && progressed) {
+    progressed = false;
+    for (let index = 0; index < batches.length; index += 1) {
+      const current = batches[index];
+      if (current.nextRetryAt > Date.now()) {
+        continue;
+      }
+      progressed = true;
+      processedAny = true;
+
+      const before = batches.slice(0, index);
+      const after = batches.slice(index + 1);
+
+      const updateQueueAndReturn = async (
+        replacement: PendingSyncBatch | null,
+        result: PushResult
+      ): Promise<PushResult> => {
+        batches = replacement ? [...before, replacement, ...after] : [...before, ...after];
+        await setPendingSyncBatches(batches);
+        return result;
+      };
+
+    const posted = await postSyncPayload(current.payload, headers);
+    if (!posted.ok) {
+      const nextAttempts = current.attempts + 1;
+      if (nextAttempts >= MAX_BATCH_ATTEMPTS) {
+        const terminalFailed: PendingSyncBatch = {
+          ...current,
+          attempts: nextAttempts,
+          nextRetryAt: 0,
+          lastError: posted.message,
+        };
+        await moveBatchToFailedArchive(terminalFailed);
+        return updateQueueAndReturn(null, {
+          success: false,
+          message: `Batch moved to failed archive after ${MAX_BATCH_ATTEMPTS} attempts.`,
+        });
+      }
+      const failed: PendingSyncBatch = {
+        ...current,
+        attempts: nextAttempts,
+        nextRetryAt: Date.now() + retryDelayForAttempt(current.attempts),
+        lastError: posted.message,
+      };
+      return updateQueueAndReturn(failed, { success: false, message: posted.message });
+    }
+    const results = posted.results ?? [];
+    const hasPartial = results.length > 0 && results.length < current.payload.logs.length;
+    if (hasPartial) {
+      const acknowledgedStatuses = new Set(['saved', 'matched', 'created', 'duplicate']);
+      const resultsByPhone = new Map(
+        results.map((r) => [normalizeDigits(String(r.phone_number ?? '')).slice(-10), r.status || ''])
+      );
+      const remainingLogs = current.payload.logs.filter((l) => {
+        const k = normalizeDigits(String(l.phone_number ?? '')).slice(-10);
+        const status = resultsByPhone.get(k);
+        return !status || !acknowledgedStatuses.has(status);
+      });
+      if (remainingLogs.length > 0) {
+        const nextAttempts = current.attempts + 1;
+        if (nextAttempts >= MAX_BATCH_ATTEMPTS) {
+          const terminalFailed: PendingSyncBatch = {
+            ...current,
+            attempts: nextAttempts,
+            nextRetryAt: 0,
+            lastError: `Partial success reached max attempts: ${results.length}/${current.payload.logs.length}`,
+          };
+          await moveBatchToFailedArchive(terminalFailed);
+          return updateQueueAndReturn(null, {
+            success: false,
+            message: `Partial batch moved to failed archive after ${MAX_BATCH_ATTEMPTS} attempts.`,
+          });
+        }
+        const partialBatch: PendingSyncBatch = {
+          ...current,
+          attempts: nextAttempts,
+          nextRetryAt: Date.now() + retryDelayForAttempt(current.attempts),
+          lastError: `Partial success: ${results.length}/${current.payload.logs.length}`,
+          payload: {
+            ...current.payload,
+            logs: remainingLogs,
+            sentAt: new Date().toISOString(),
+          },
+          signature: remainingLogs
+            .map((l) => `${String(l.callId ?? l.id)}|${String(l.called_at ?? '')}`)
+            .join('||'),
+          recordingItems: remainingLogs.reduce(
+            (acc, l) => acc + (l.recordings?.length ?? 0),
+            0
+          ),
+        };
+        return updateQueueAndReturn(partialBatch, {
+          success: false,
+          message: `Partial sync success. Remaining ${remainingLogs.length} logs queued for retry.`,
+        });
+      }
+    }
+      batches = [...before, ...after];
+      await setPendingSyncBatches(batches);
+    lastSyncSignature = current.signature;
+    lastSyncAtMs = Date.now();
+    lastSyncRecordingItems = current.recordingItems;
+    lastSuccess = {
+      success: true,
+      message: posted.message,
+      count: posted.count,
+      results: posted.results,
+    };
+      break;
+    }
+  }
+  if (!processedAny) {
+    const nextDueMs = Math.min(...batches.map((b) => b.nextRetryAt));
+    return {
+      success: false,
+      message: `Retry scheduled in ${Math.ceil((nextDueMs - Date.now()) / 1000)}s.`,
+    };
+  }
+  return lastSuccess;
 }
 
 export interface PushResult {
@@ -336,7 +687,8 @@ async function uploadRecordingIfNeeded(
 
 export async function pushCallsToPortal(
   calls: CallLog[],
-  options: SyncOptions = {}
+  options: SyncOptions = {},
+  syncMode: SyncMode = 'manual'
 ): Promise<PushResult> {
   if (syncRequestInFlight) {
     console.log('[sync-lock] skipped duplicate sync request', { callCount: calls.length });
@@ -468,7 +820,7 @@ export async function pushCallsToPortal(
       };
     });
 
-    const payload = {
+    const payload: SyncPayload = {
       logs,
       ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
@@ -484,22 +836,27 @@ export async function pushCallsToPortal(
       return acc + n;
     }, 0);
     const samplePairs = payload.logs.flatMap((l) => {
-      const recs = (l as { recordings?: Array<Record<string, unknown>> }).recordings ?? [];
+      const recs = l.recordings ?? [];
       return recs.slice(0, 1).map((r) => ({
-        callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
-        phone: String((l as Record<string, unknown>).phone_number ?? ''),
+        callId: String(l.callId || l.id || ''),
+        phone: String(l.phone_number || ''),
         recording_external_id: String(r.recording_external_id ?? ''),
       }));
     }).slice(0, 5);
     const first2Compact = payload.logs.slice(0, 2).map((l) => ({
-      callId: String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? ''),
-      recordingsLength: ((l as { recordings?: unknown[] }).recordings?.length ?? 0),
+      callId: String(l.callId || l.id || ''),
+      recordingsLength: (l.recordings?.length ?? 0),
     }));
     const syncSignature = payload.logs
       .map((l) => {
-        const callId = String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? '');
-        const calledAt = String((l as Record<string, unknown>).called_at ?? '');
-        return `${callId}|${calledAt}`;
+        const callId = String(l.callId || l.id || '');
+        const calledAt = String(l.called_at || '');
+        const recIds = (l.recordings ?? [])
+          .map((r) => String(r.recording_external_id ?? ''))
+          .filter(Boolean)
+          .sort()
+          .join(',');
+        return `${callId}|${calledAt}|${recIds}`;
       })
       .join('||');
     const nowMs = Date.now();
@@ -553,7 +910,7 @@ export async function pushCallsToPortal(
     }
     const latestCallLogEntry = latestCallId
       ? payload.logs.find(
-        (l) => String((l as Record<string, unknown>).callId ?? (l as Record<string, unknown>).id ?? '') === latestCallId
+        (l) => String(l.callId || l.id || '') === latestCallId
       ) as { recordings?: unknown[] } | undefined
       : undefined;
     const latestCallPayloadRecordings = latestCallLogEntry?.recordings?.length ?? 0;
@@ -579,48 +936,17 @@ export async function pushCallsToPortal(
       console.log('[sync-payload] no non-empty recordings before /sync (expected if batch has no matched files)');
     }
     console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
-    const controller = new AbortController();
-    const syncTimeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
-    const res = await fetch(PORTAL_API_URL, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal,
-    }).finally(() => clearTimeout(syncTimeout));
-    if (!res.ok) {
-      let details = '';
-      try {
-        details = await res.text();
-      } catch {
-        details = '';
-      }
-      const msg = details
-        ? `Portal responded with ${res.status}: ${details}`
-        : `Portal responded with ${res.status}`;
-      return { success: false, message: msg };
-    }
-    let apiMessage = `${callsForPayload.length} call(s) pushed to portal.`;
-    let savedCount = callsForPayload.length;
-    let results: PushResult['results'];
-    try {
-      const json = (await res.json()) as {
-        message?: string;
-        saved?: number;
-        results?: PushResult['results'];
-      };
-      if (json.message) apiMessage = json.message;
-      if (typeof json.saved === 'number') savedCount = json.saved;
-      if (Array.isArray(json.results)) {
-        results = json.results;
-        savedCount = json.results.length;
-      }
-    } catch {
-      // Keep fallback success message
-    }
-    lastSyncSignature = syncSignature;
-    lastSyncAtMs = Date.now();
-    lastSyncRecordingItems = totalRecordingItems;
-    return { success: true, message: apiMessage, count: savedCount, results };
+    await enqueuePendingSyncBatch({
+      id: makeDeterministicBatchId(syncSignature) || makeBatchId(),
+      signature: syncSignature,
+      priority: syncMode === 'manual' ? 'high' : 'normal',
+      recordingItems: totalRecordingItems,
+      createdAt: Date.now(),
+      attempts: 0,
+      nextRetryAt: Date.now(),
+      payload,
+    });
+    return flushPendingSyncBatches(headers);
   } catch (e) {
     const isAbort = e instanceof Error && e.name === 'AbortError';
     const msg = isAbort
@@ -638,7 +964,8 @@ export async function pushCallsToPortal(
 
 export async function pushSingleCallToPortal(
   call: CallLog,
-  options: SyncOptions = {}
+  options: SyncOptions = {},
+  syncMode: SyncMode = 'manual'
 ): Promise<PushResult> {
-  return pushCallsToPortal([call], options);
+  return pushCallsToPortal([call], options, syncMode);
 }

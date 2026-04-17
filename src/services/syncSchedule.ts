@@ -80,7 +80,7 @@ export async function runScheduledSync(): Promise<void> {
 
     const syncOptions = await buildRecordingSyncOptions(callsToSend);
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
-      const result = await pushCallsToPortal(callsToSend, syncOptions);
+      const result = await pushCallsToPortal(callsToSend, syncOptions, 'auto');
       if (result.success) {
         const newestTs = Math.max(...callsToSend.map(getCallTimeMs));
         await setLastSyncedAt(newestTs);

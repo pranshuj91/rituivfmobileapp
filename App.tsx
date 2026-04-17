@@ -6,6 +6,7 @@
 import React, { useEffect, useRef } from 'react';
 import { AppState, AppStateStatus, StatusBar } from 'react-native';
 import BackgroundFetch from 'react-native-background-fetch';
+import NetInfo from '@react-native-community/netinfo';
 import { runScheduledSync, shouldRunSyncNow } from './src/services/syncSchedule';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -40,6 +41,7 @@ const BACKGROUND_FETCH_INTERVAL_MINUTES = 30;
 export default function App() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const wasConnectedRef = useRef<boolean>(true);
 
   useEffect(() => {
     // Run sync once shortly after launch if threshold passed (or never synced)
@@ -62,11 +64,20 @@ export default function App() {
         });
       }
     });
+    const netSub = NetInfo.addEventListener((state) => {
+      const isConnected = !!state.isConnected && state.isInternetReachable !== false;
+      const becameConnected = !wasConnectedRef.current && isConnected;
+      wasConnectedRef.current = isConnected;
+      if (becameConnected) {
+        runScheduledSync();
+      }
+    });
 
     return () => {
       clearTimeout(t);
       if (intervalRef.current) clearInterval(intervalRef.current);
       sub.remove();
+      netSub();
     };
   }, []);
 

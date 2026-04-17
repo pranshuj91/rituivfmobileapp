@@ -183,7 +183,7 @@ export function CallLogsScreen() {
     try {
       setPushingId(call.id);
       const syncOptions = await buildRecordingSyncOptions([call]);
-      const result = await pushSingleCallToPortal(call, syncOptions);
+      const result = await pushSingleCallToPortal(call, syncOptions, 'manual');
       if (result.success) {
         setSyncedIds((prev) => new Set([...prev, call.id]));
         const now = Date.now();
@@ -207,7 +207,7 @@ export function CallLogsScreen() {
     try {
       setPushingId('all');
       const syncOptions = await buildRecordingSyncOptions(logs);
-      const result = await pushCallsToPortal(logs, syncOptions);
+      const result = await pushCallsToPortal(logs, syncOptions, 'manual');
       if (result.success) {
         setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
         const now = Date.now();
