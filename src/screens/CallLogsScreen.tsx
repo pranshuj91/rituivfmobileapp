@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Modal,
   Platform,
   PermissionsAndroid,
   StyleSheet,
@@ -18,11 +19,19 @@ import type { CallLog } from 'react-native-call-log';
 import { enrichCallLogsWithContactNames } from '../services/callLogNames';
 import {
   getLastSyncedAt,
+  getSyncedCallIds,
   pushCallsToPortal,
   pushSingleCallToPortal,
   setLastSyncedAt,
 } from '../services/portal';
 import { buildRecordingSyncOptions } from '../services/recordings';
+import {
+  filterLeadCalls,
+  findLeadForCall,
+  getLeadPhoneIndex,
+  type LeadPhoneIndex,
+} from '../services/leadIndex';
+import { getAllCallSyncEnabled } from '../services/appSettings';
 import { theme } from '../theme';
 
 const CALL_LOG_PERMISSIONS = [
@@ -37,6 +46,71 @@ const CALL_LOG_PERMISSIONS = [
 ];
 const AUTO_REFRESH_MS = 60 * 1000;
 
+/** What each permission is for, shown before the system prompts appear. */
+const PERMISSION_EXPLAINERS: Array<{ icon: string; title: string; text: string }> = [
+  {
+    icon: 'phone-log',
+    title: 'Call history',
+    text: 'To show your calls with CRM leads and sync them.',
+  },
+  {
+    icon: 'cellphone-information',
+    title: 'Phone status',
+    text: 'To know which number this phone uses.',
+  },
+  {
+    icon: 'music-box-multiple-outline',
+    title: 'Audio files',
+    text: 'To find the call recordings saved by your dialer.',
+  },
+];
+
+function PermissionExplainer({
+  visible,
+  onAllow,
+  onClose,
+}: {
+  visible: boolean;
+  onAllow: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.modalBackdrop}>
+        <View style={styles.modalCard}>
+          <View style={styles.modalIconWrap}>
+            <Icon name="shield-check-outline" size={34} color={theme.colors.primary} />
+          </View>
+          <Text style={styles.modalTitle}>Allow access</Text>
+          <Text style={styles.modalSubtitle}>
+            The app needs a few permissions to work. Android will ask you to confirm each one next.
+          </Text>
+          {PERMISSION_EXPLAINERS.map((p) => (
+            <View key={p.title} style={styles.modalRow}>
+              <View style={styles.modalRowIcon}>
+                <Icon name={p.icon} size={20} color={theme.colors.primary} />
+              </View>
+              <View style={styles.modalRowText}>
+                <Text style={styles.modalRowTitle}>{p.title}</Text>
+                <Text style={styles.modalRowHint}>{p.text}</Text>
+              </View>
+            </View>
+          ))}
+          <Text style={styles.modalNote}>
+            Only calls with CRM lead numbers are read and synced. Nothing else leaves your phone.
+          </Text>
+          <TouchableOpacity style={styles.modalPrimary} onPress={onAllow}>
+            <Text style={styles.modalPrimaryText}>Continue</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.modalSecondary} onPress={onClose}>
+            <Text style={styles.modalSecondaryText}>Not now</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 function formatDuration(seconds: number): string {
   if (seconds < 0) return '—';
   const m = Math.floor(seconds / 60);
@@ -49,6 +123,7 @@ interface CallLogItemProps {
   onPush: (call: CallLog) => void;
   pushing: boolean;
   synced: boolean;
+  leadName?: string;
 }
 
 function formatLastSync(ms: number | null): string {
@@ -56,7 +131,7 @@ function formatLastSync(ms: number | null): string {
   return `Last sync: ${new Date(ms).toLocaleString()}`;
 }
 
-function CallLogItemRow({ item, onPush, pushing, synced }: CallLogItemProps) {
+function CallLogItemRow({ item, onPush, pushing, synced, leadName }: CallLogItemProps) {
   return (
     <View style={styles.logItem}>
       <View style={styles.logMain}>
@@ -74,6 +149,12 @@ function CallLogItemRow({ item, onPush, pushing, synced }: CallLogItemProps) {
         </View>
         {item.name ? (
           <Text style={styles.logName} numberOfLines={1}>{item.name}</Text>
+        ) : null}
+        {leadName ? (
+          <View style={styles.leadRow}>
+            <Icon name="account-check-outline" size={14} color={theme.colors.primary} />
+            <Text style={styles.leadName} numberOfLines={1}>Lead: {leadName}</Text>
+          </View>
         ) : null}
       </View>
       {synced ? (
@@ -108,10 +189,18 @@ export function CallLogsScreen() {
   const [syncedIds, setSyncedIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [lastSyncedAtMs, setLastSyncedAtMs] = useState<number | null>(null);
+  const [leadIndex, setLeadIndex] = useState<LeadPhoneIndex | null>(null);
+  const [hiddenCount, setHiddenCount] = useState(0);
+  const [showExplainer, setShowExplainer] = useState(false);
+  const [allCallSync, setAllCallSync] = useState(false);
 
   const refreshLastSync = useCallback(async () => {
-    const last = await getLastSyncedAt();
+    const [last, ids] = await Promise.all([getLastSyncedAt(), getSyncedCallIds()]);
     setLastSyncedAtMs(last);
+    // Calls the CRM has acknowledged, persisted across app restarts. Only replace
+    // the in-session set when the stored list has something, so ticks from a
+    // push made moments ago are never lost.
+    if (ids.size > 0) setSyncedIds((prev) => new Set([...prev, ...ids]));
   }, []);
 
   useEffect(() => {
@@ -149,14 +238,53 @@ export function CallLogsScreen() {
     }
   }, []);
 
+  // Already-granted permissions: skip the explainer and the system prompts.
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    Promise.all(CALL_LOG_PERMISSIONS.map((p) => PermissionsAndroid.check(p)))
+      .then((results) => {
+        if (results.every(Boolean)) setPermissionGranted(true);
+      })
+      .catch(() => undefined);
+  }, []);
+
+  const onAllowPressed = useCallback(() => {
+    setShowExplainer(false);
+    // Let the modal close before the system dialogs open.
+    setTimeout(() => {
+      requestPermissions();
+    }, 150);
+  }, [requestPermissions]);
+
   const loadCallLogs = useCallback(async (silent = false) => {
     if (Platform.OS !== 'android') return;
     if (loadingRef.current) return;
     if (!silent) setLoading(true);
     if (!silent) setError(null);
     try {
-      const list = await CallLogs.load(100);
-      setLogs(await enrichCallLogsWithContactNames(list));
+      // Only calls with CRM lead numbers are shown and synced; load a wider
+      // window from the device because most entries are filtered out.
+      const list = await CallLogs.load(300);
+      const enriched = await enrichCallLogsWithContactNames(list);
+      const allCalls = await getAllCallSyncEnabled();
+      setAllCallSync(allCalls);
+      const index = await getLeadPhoneIndex();
+      setLeadIndex(index);
+      if (allCalls) {
+        // "All call sync" on: every call is listed and synced.
+        setLogs(enriched);
+        setHiddenCount(0);
+      } else if (!index) {
+        setLogs([]);
+        setHiddenCount(0);
+        if (!silent) {
+          setError('Could not load the CRM lead list. Connect to the internet and tap "Load calls" again.');
+        }
+      } else {
+        const leadCalls = filterLeadCalls(index, enriched);
+        setLogs(leadCalls);
+        setHiddenCount(enriched.length - leadCalls.length);
+      }
       await refreshLastSync();
     } catch (e) {
       if (!silent) {
@@ -246,14 +374,23 @@ export function CallLogsScreen() {
     <View style={[styles.container, padding]}>
       <View style={styles.header}>
         <Text style={styles.title}>Call logs</Text>
-        <Text style={styles.subtitle}>Load and push to portal</Text>
+        <Text style={styles.subtitle}>
+          {allCallSync ? 'All calls on this phone' : 'Calls with CRM leads only'}
+          {!allCallSync && hiddenCount > 0 ? ` · ${hiddenCount} other call${hiddenCount === 1 ? '' : 's'} hidden` : ''}
+        </Text>
         <Text style={styles.lastSyncText}>{formatLastSync(lastSyncedAtMs)}</Text>
       </View>
+
+      <PermissionExplainer
+        visible={showExplainer}
+        onAllow={onAllowPressed}
+        onClose={() => setShowExplainer(false)}
+      />
 
       {permissionGranted === null && (
         <TouchableOpacity
           style={styles.primaryButton}
-          onPress={requestPermissions}
+          onPress={() => setShowExplainer(true)}
           disabled={loading}
         >
           {loading ? (
@@ -280,7 +417,7 @@ export function CallLogsScreen() {
               ) : (
                 <>
                   <Icon name="reload" size={20} color={theme.colors.primary} />
-                  <Text style={styles.secondaryButtonText}>Load (last 100)</Text>
+                  <Text style={styles.secondaryButtonText}>Load calls</Text>
                 </>
               )}
             </TouchableOpacity>
@@ -316,13 +453,18 @@ export function CallLogsScreen() {
                 onPush={handlePushOne}
                 pushing={pushingId === item.id}
                 synced={syncedIds.has(item.id)}
+                leadName={findLeadForCall(leadIndex, item)?.name || undefined}
               />
             )}
             style={styles.list}
             contentContainerStyle={styles.listContent}
             ListEmptyComponent={
               !loading && permissionGranted ? (
-                <Text style={styles.empty}>No call logs. Tap "Load (last 100)" above.</Text>
+                <Text style={styles.empty}>
+                  {allCallSync
+                    ? 'No calls on this phone yet. Tap "Load calls" after your next call.'
+                    : 'No calls with CRM leads yet. Call a lead from the Leads tab, then tap "Load calls".'}
+                </Text>
               ) : null
             }
           />
@@ -332,7 +474,7 @@ export function CallLogsScreen() {
       {permissionGranted === false && (
         <View style={styles.errorBox}>
           <Text style={styles.errorText}>{error ?? 'Permissions were denied.'}</Text>
-          <TouchableOpacity style={styles.primaryButton} onPress={requestPermissions} disabled={loading}>
+          <TouchableOpacity style={styles.primaryButton} onPress={() => setShowExplainer(true)} disabled={loading}>
             <Text style={styles.primaryButtonText}>Try again</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={handleOpenSettings}>
@@ -485,6 +627,18 @@ const styles = StyleSheet.create({
     color: theme.colors.tabInactive,
     marginTop: 2,
   },
+  leadRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 2,
+  },
+  leadName: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: theme.colors.primary,
+    flex: 1,
+  },
   pushBtn: {
     width: 44,
     height: 44,
@@ -526,5 +680,99 @@ const styles = StyleSheet.create({
     fontSize: 14,
     textAlign: 'center',
     marginTop: theme.spacing.lg,
+  },
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(28, 25, 23, 0.55)',
+    justifyContent: 'center',
+    padding: theme.spacing.lg,
+  },
+  modalCard: {
+    backgroundColor: theme.colors.white,
+    borderRadius: theme.radius.lg + 4,
+    padding: theme.spacing.lg,
+    alignItems: 'stretch',
+    ...theme.shadows.md,
+  },
+  modalIconWrap: {
+    alignSelf: 'center',
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: theme.colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: theme.spacing.md,
+  },
+  modalTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: theme.colors.text,
+    textAlign: 'center',
+  },
+  modalSubtitle: {
+    fontSize: 14,
+    color: theme.colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginTop: theme.spacing.xs,
+    marginBottom: theme.spacing.md,
+  },
+  modalRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: theme.spacing.sm + 4,
+    paddingVertical: theme.spacing.sm,
+  },
+  modalRowIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: theme.colors.backgroundSecondary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalRowText: {
+    flex: 1,
+  },
+  modalRowTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: theme.colors.text,
+  },
+  modalRowHint: {
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    lineHeight: 18,
+    marginTop: 1,
+  },
+  modalNote: {
+    fontSize: 12,
+    color: theme.colors.tabInactive,
+    textAlign: 'center',
+    lineHeight: 17,
+    marginTop: theme.spacing.sm,
+    marginBottom: theme.spacing.md,
+  },
+  modalPrimary: {
+    backgroundColor: theme.colors.primary,
+    paddingVertical: theme.spacing.md,
+    borderRadius: theme.radius.md,
+    alignItems: 'center',
+  },
+  modalPrimaryText: {
+    color: theme.colors.textOnPrimary,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  modalSecondary: {
+    paddingVertical: theme.spacing.sm + 4,
+    alignItems: 'center',
+    marginTop: theme.spacing.xs,
+  },
+  modalSecondaryText: {
+    color: theme.colors.textSecondary,
+    fontSize: 15,
+    fontWeight: '600',
   },
 });

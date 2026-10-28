@@ -19,3 +19,19 @@ buildscript {
 }
 
 apply plugin: "com.facebook.react.rootproject"
+
+// On Windows, ninja rejects any path over 260 characters, and the native
+// (CMake) build of every library module writes under node_modules/<lib>/android/.cxx,
+// which with a long project path overflows that limit (the release variant name
+// "RelWithDebInfo" alone was enough to break @react-native-community/javascriptcore).
+// Keep each module's native build under a short path instead.
+// The app module does the same in app/build.gradle.
+if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+    def shortCxxRoot = "${System.getProperty('user.home')}/.cxx/gaincafecrm"
+    subprojects { sub ->
+        sub.plugins.withId("com.android.library") {
+            sub.android.externalNativeBuild.cmake.buildStagingDirectory =
+                sub.file("${shortCxxRoot}/${sub.name}")
+        }
+    }
+}

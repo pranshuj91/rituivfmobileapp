@@ -1,24 +1,54 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { CallLog } from 'react-native-call-log';
 import RNFS from 'react-native-fs';
-import Config from 'react-native-config';
 import { enrichCallLogsWithContactNames } from './callLogNames';
+import { AuthError, CRM_API_BASE_URL, clearSession, getAuthHeaders, getSession } from './auth';
+import { filterLeadCalls, findLeadForCall, getLeadPhoneIndex } from './leadIndex';
+import { getAllCallSyncEnabled } from './appSettings';
 
-/** Portal API URL – set in code; not configurable in Settings. */
-const PORTAL_API_URL =
-  Config.CALL_LOG_SYNC_URL || 'https://leadtracker.gaincafe.com/api/call-logs/sync';
-const RECORDING_UPLOAD_URL =
-  Config.CALL_LOG_UPLOAD_URL || 'https://leadtracker.gaincafe.com/api/call-logs/upload-recording';
+/**
+ * Gaincafe CRM call-sync endpoints. Both require the per-agent headers from
+ * auth.ts (Authorization: Bearer <token> and X-Workspace-Id: <workspace uuid>).
+ */
+const PORTAL_API_URL = `${CRM_API_BASE_URL}/call-logs/sync`;
+const RECORDING_UPLOAD_URL = `${CRM_API_BASE_URL}/call-logs/upload-recording`;
 
-/** Optional: set in code if your backend requires these headers. */
-const CALL_LOG_APP_KEY = Config.CALL_LOG_APP_KEY || '';
-const AUTHORIZATION = Config.CALL_LOG_AUTHORIZATION || ''; // e.g. 'Bearer token'
+const DEVICE_NAME_KEY = '@gaincafe_device_name';
+const DEVICE_PHONE_KEY = '@gaincafe_device_phone';
+const LAST_SYNCED_AT_KEY = '@gaincafe_last_synced_at';
+const PENDING_SYNC_BATCHES_KEY = '@gaincafe_pending_sync_batches';
+const FAILED_SYNC_BATCHES_KEY = '@gaincafe_failed_sync_batches';
+const SYNCED_CALL_IDS_KEY = '@gaincafe_synced_call_ids';
+const MAX_SYNCED_CALL_IDS = 2000;
+let syncedCallIdsCache: Set<string> | null = null;
 
-const DEVICE_NAME_KEY = '@ritu_device_name';
-const DEVICE_PHONE_KEY = '@ritu_device_phone';
-const LAST_SYNCED_AT_KEY = '@ritu_last_synced_at';
-const PENDING_SYNC_BATCHES_KEY = '@ritu_pending_sync_batches';
-const FAILED_SYNC_BATCHES_KEY = '@ritu_failed_sync_batches';
+/** Device call ids the CRM has acknowledged (saved/matched/created/duplicate). */
+export async function getSyncedCallIds(): Promise<Set<string>> {
+  if (syncedCallIdsCache) return syncedCallIdsCache;
+  try {
+    const raw = await AsyncStorage.getItem(SYNCED_CALL_IDS_KEY);
+    const list = raw ? (JSON.parse(raw) as string[]) : [];
+    syncedCallIdsCache = new Set(Array.isArray(list) ? list.map(String) : []);
+  } catch {
+    syncedCallIdsCache = new Set();
+  }
+  return syncedCallIdsCache;
+}
+
+async function markCallsSynced(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const set = await getSyncedCallIds();
+  ids.forEach((id) => set.add(String(id)));
+  // Keep the newest ids only (ids are per device and roughly increasing).
+  const list = Array.from(set);
+  const capped = list.length > MAX_SYNCED_CALL_IDS ? list.slice(list.length - MAX_SYNCED_CALL_IDS) : list;
+  syncedCallIdsCache = new Set(capped);
+  try {
+    await AsyncStorage.setItem(SYNCED_CALL_IDS_KEY, JSON.stringify(capped));
+  } catch {
+    // Memory copy still serves this session.
+  }
+}
 const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
 const uploadedRecordingUrlByExternalId = new Map<string, string>();
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
@@ -52,6 +82,11 @@ interface SyncPayload {
   deviceName?: string;
   devicePhone?: string;
   sentAt: string;
+  /**
+   * true when "All call sync" is on: the CRM may create a lead for numbers that
+   * match no existing lead. false: the app only sends calls with known leads.
+   */
+  create_unmatched_leads: boolean;
 }
 
 interface PendingSyncBatch {
@@ -73,6 +108,7 @@ export interface DeviceInfo {
   devicePhone: string;
 }
 
+/** Values the user typed in Settings (both optional). */
 export async function getDeviceInfo(): Promise<DeviceInfo> {
   try {
     const [name, phone] = await Promise.all([
@@ -89,6 +125,24 @@ export async function getDeviceInfo(): Promise<DeviceInfo> {
       devicePhone: '',
     };
   }
+}
+
+/** Name used when Settings has no device name: the logged-in agent's name or email. */
+export async function getDefaultDeviceName(): Promise<string> {
+  const session = await getSession();
+  const name = (session?.user?.name || '').trim();
+  if (name) return name;
+  return (session?.user?.email || '').trim();
+}
+
+/**
+ * Device identity sent with every sync. The device name falls back to the
+ * logged-in agent so nothing has to be typed in Settings.
+ */
+export async function getEffectiveDeviceInfo(): Promise<DeviceInfo> {
+  const info = await getDeviceInfo();
+  const deviceName = info.deviceName.trim() || (await getDefaultDeviceName());
+  return { deviceName, devicePhone: info.devicePhone.trim() };
 }
 
 export async function setDeviceInfo(deviceName: string, devicePhone: string): Promise<void> {
@@ -256,6 +310,11 @@ async function postSyncPayload(
     body: JSON.stringify(payload),
     signal: controller.signal,
   }).finally(() => clearTimeout(syncTimeout));
+  if (res.status === 401) {
+    // Token revoked (logout elsewhere, password change, member suspended).
+    await clearSession();
+    return { ok: false, message: 'Your session has expired. Please log in again.' };
+  }
   if (!res.ok) {
     let details = '';
     try {
@@ -351,17 +410,27 @@ async function flushPendingSyncBatches(
       return updateQueueAndReturn(failed, { success: false, message: posted.message });
     }
     const results = posted.results ?? [];
+    // 'invalid' = CRM rejected that one log as malformed; resending the same data
+    // cannot fix it, so treat it as final instead of retrying for 16 attempts.
+    const acknowledgedStatuses = new Set(['saved', 'matched', 'created', 'duplicate', 'invalid']);
+    results
+      .filter((r) => r.status === 'invalid')
+      .forEach((r) => console.warn('[sync-result] CRM marked log invalid', r));
+    const resultsByPhone = new Map(
+      results.map((r) => [normalizeDigits(String(r.phone_number ?? '')).slice(-10), r.status || ''])
+    );
+    const isAcknowledged = (l: SyncPayloadLog): boolean => {
+      if (results.length === 0) return true; // response without per-log results: whole batch accepted
+      const status = resultsByPhone.get(normalizeDigits(String(l.phone_number ?? '')).slice(-10));
+      return !!status && acknowledgedStatuses.has(status);
+    };
+    // Remember which device calls the CRM accepted, so "Synced" in the UI is exact.
+    await markCallsSynced(
+      current.payload.logs.filter(isAcknowledged).map((l) => String(l.callId ?? l.id))
+    );
     const hasPartial = results.length > 0 && results.length < current.payload.logs.length;
     if (hasPartial) {
-      const acknowledgedStatuses = new Set(['saved', 'matched', 'created', 'duplicate']);
-      const resultsByPhone = new Map(
-        results.map((r) => [normalizeDigits(String(r.phone_number ?? '')).slice(-10), r.status || ''])
-      );
-      const remainingLogs = current.payload.logs.filter((l) => {
-        const k = normalizeDigits(String(l.phone_number ?? '')).slice(-10);
-        const status = resultsByPhone.get(k);
-        return !status || !acknowledgedStatuses.has(status);
-      });
+      const remainingLogs = current.payload.logs.filter((l) => !isAcknowledged(l));
       if (remainingLogs.length > 0) {
         const nextAttempts = current.attempts + 1;
         if (nextAttempts >= MAX_BATCH_ATTEMPTS) {
@@ -433,7 +502,8 @@ export interface PushResult {
     phone_number: string;
     normalized?: string;
     status: string;
-    call_log_id?: number;
+    /** CRM uses uuid primary keys */
+    call_log_id?: string | number;
     recordings_saved?: number;
     lead?: unknown;
   }>;
@@ -578,7 +648,8 @@ function strictRecordingMatchesCall(recording: Record<string, unknown>, log: Rec
 
 async function uploadRecordingIfNeeded(
   recording: Record<string, unknown>,
-  callId: string
+  callId: string,
+  authHeaders: Record<string, string>
 ): Promise<Record<string, unknown> | null> {
   const rawUrl = typeof recording.recording_url === 'string' ? recording.recording_url : '';
   const externalId = String(recording.recording_external_id ?? '');
@@ -614,11 +685,8 @@ async function uploadRecordingIfNeeded(
 
   try {
     const filename = filePath.split('/').pop() || 'recording.mp3';
-    const uploadHeaders: Record<string, string> = {
-      Accept: 'application/json',
-    };
-    if (CALL_LOG_APP_KEY) uploadHeaders['X-App-Key'] = CALL_LOG_APP_KEY;
-    if (AUTHORIZATION) uploadHeaders.Authorization = AUTHORIZATION;
+    // Multipart upload: auth headers only, no JSON content type.
+    const uploadHeaders: Record<string, string> = { ...authHeaders };
     const uploadPromise = RNFS.uploadFiles({
       toUrl: RECORDING_UPLOAD_URL,
       files: [
@@ -699,16 +767,62 @@ export async function pushCallsToPortal(
   }
   syncRequestInFlight = true;
   try {
+    // "All call sync" off (default): only calls with numbers that exist as CRM
+    // leads are uploaded. On: every call goes up and the CRM may create leads.
+    const allCallSync = await getAllCallSyncEnabled();
+    const leadIndex = await getLeadPhoneIndex();
+    let leadCalls: CallLog[];
+    if (allCallSync) {
+      leadCalls = calls;
+    } else {
+      if (!leadIndex) {
+        return {
+          success: false,
+          message: 'CRM lead list is not available. Open the Leads tab while online, then try again.',
+        };
+      }
+      leadCalls = filterLeadCalls(leadIndex, calls);
+      if (leadCalls.length === 0) {
+        return {
+          success: false,
+          message: calls.length === 1
+            ? 'This number is not a lead in the CRM, so the call was not synced. Turn on "All call sync" in Settings to sync every call.'
+            : 'None of these calls are with CRM leads, so nothing was synced. Turn on "All call sync" in Settings to sync every call.',
+        };
+      }
+    }
+    // Diagnostics: why each call is being sent (toggle state + matched lead).
+    console.log('[sync-filter]', JSON.stringify({
+      allCallSync,
+      received: calls.length,
+      sending: leadCalls.length,
+      matches: leadCalls.slice(0, 20).map((c) => {
+        const lead = findLeadForCall(leadIndex, c);
+        const digits = (c.phoneNumber || c.formattedNumber || '').replace(/\D/g, '');
+        return {
+          last4: digits.slice(-4),
+          type: c.type,
+          lead: lead ? { name: lead.name, status: lead.status, source: lead.source, createdAt: lead.createdAt } : null,
+        };
+      }),
+    }));
     // Dialer often shows a name while CallLogs.load() leaves name empty; fill from contacts when allowed.
-    const callsForPayload = await enrichCallLogsWithContactNames(calls);
+    const callsForPayload = await enrichCallLogsWithContactNames(leadCalls);
     const currentCallIds = new Set(callsForPayload.map((c) => String(c.id)));
-    const deviceInfo = await getDeviceInfo();
+    const deviceInfo = await getEffectiveDeviceInfo();
+    let authHeaders: Record<string, string>;
+    try {
+      authHeaders = await getAuthHeaders();
+    } catch (e) {
+      return {
+        success: false,
+        message: e instanceof AuthError ? e.message : 'Not logged in. Please log in first.',
+      };
+    }
     const headers: Record<string, string> = {
-      Accept: 'application/json',
+      ...authHeaders,
       'Content-Type': 'application/json',
     };
-    if (CALL_LOG_APP_KEY) headers['X-App-Key'] = CALL_LOG_APP_KEY;
-    if (AUTHORIZATION) headers.Authorization = AUTHORIZATION;
 
     const logsBase = await Promise.all(callsForPayload.map(async (c) => {
       const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
@@ -721,14 +835,15 @@ export async function pushCallsToPortal(
         return !!recCallId && recCallId === String(c.id) && currentCallIds.has(recCallId);
       });
       const calledAt = toCalledAt(c);
-      await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id)));
+      await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id, authHeaders)));
       const phoneNumber = c.phoneNumber || c.formattedNumber || '';
       const contactName = (c.name || '').trim();
+      const leadName = findLeadForCall(leadIndex, c)?.name ?? '';
       return {
         id: c.id,
         callId: c.id,
         phone_number: phoneNumber,
-        name: contactName || phoneNumber,
+        name: contactName || leadName || phoneNumber,
         direction: toDirection(c.type),
         duration_seconds: c.duration,
         called_at: calledAt,
@@ -825,6 +940,7 @@ export async function pushCallsToPortal(
       ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
       sentAt: new Date().toISOString(),
+      create_unmatched_leads: allCallSync,
     };
     // Normal when no files matched / no local recordings — only noisy as a warning.
     if (!payload.logs.some((l) => (l as { recordings?: unknown[] }).recordings?.length)) {

@@ -1,4 +1,4 @@
-# Ritu IVF Call Sync App - Quick User Guide
+# Gaincafe CRM Call Sync App - Quick User Guide
 
 ## Must Have (Important)
 

@@ -30,6 +30,22 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
+        <!-- "Share to Gaincafe CRM": receive call recordings shared from the dialer -->
+        <intent-filter android:label="Share to Gaincafe CRM">
+            <action android:name="android.intent.action.SEND" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <data android:mimeType="audio/*" />
+        </intent-filter>
+        <intent-filter android:label="Share to Gaincafe CRM">
+            <action android:name="android.intent.action.SEND" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <data android:mimeType="application/octet-stream" />
+        </intent-filter>
+        <intent-filter android:label="Share to Gaincafe CRM">
+            <action android:name="android.intent.action.SEND_MULTIPLE" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <data android:mimeType="audio/*" />
+        </intent-filter>
       </activity>
     </application>
 </manifest>

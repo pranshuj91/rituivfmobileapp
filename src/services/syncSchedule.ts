@@ -8,7 +8,7 @@
  * the newest call timestamp in the batch so the next run continues from there.
  */
 
-import { Platform } from 'react-native';
+import { PermissionsAndroid, Platform } from 'react-native';
 import CallLogs from 'react-native-call-log';
 import type { CallLog } from 'react-native-call-log';
 import NetInfo from '@react-native-community/netinfo';
@@ -18,9 +18,12 @@ import {
   setLastSyncedAt,
 } from './portal';
 import { buildRecordingSyncOptions } from './recordings';
+import { isLoggedIn } from './auth';
+import { filterLeadCalls, getLeadPhoneIndex } from './leadIndex';
+import { getAllCallSyncEnabled } from './appSettings';
 
-/** Max calls per request to keep payload size reasonable. */
-const BATCH_LIMIT = 100;
+/** Max device calls examined per run; most are filtered out (non-lead numbers). */
+const BATCH_LIMIT = 200;
 const THIRTY_MINUTES_MS = 30 * 60 * 1000;
 const RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 let scheduledSyncInFlight = false;
@@ -53,45 +56,97 @@ async function isNetworkConnected(): Promise<boolean> {
   }
 }
 
+export interface ScheduledSyncResult {
+  status: 'synced' | 'nothing' | 'skipped' | 'failed';
+  message: string;
+  /** Calls sent in this run */
+  sent: number;
+}
+
 /**
  * Run the same sync as manual "Push to portal": load call logs from the device (calls after
  * last_synced_at, or from install if no last_synced_at; cap at BATCH_LIMIT per request),
  * then POST to /api/call-logs/sync. On success sets last_synced_at to the newest call
  * timestamp in the batch so the next run won't miss older calls. On error, skips (next run retries).
  */
-export async function runScheduledSync(): Promise<void> {
-  if (Platform.OS !== 'android') return;
+export async function runScheduledSync(): Promise<ScheduledSyncResult> {
+  if (Platform.OS !== 'android') {
+    return { status: 'skipped', message: 'Call sync is only available on Android.', sent: 0 };
+  }
   if (scheduledSyncInFlight) {
     console.log('[auto-sync] skipped: scheduled sync already running');
-    return;
+    return { status: 'skipped', message: 'A sync is already running.', sent: 0 };
   }
   scheduledSyncInFlight = true;
 
   try {
-    if (!(await isNetworkConnected())) return;
+    if (!(await isNetworkConnected())) {
+      return { status: 'skipped', message: 'No internet connection.', sent: 0 };
+    }
+    // No agent session: nothing to sync against (the app shows the login screen).
+    if (!(await isLoggedIn())) {
+      return { status: 'skipped', message: 'Not signed in.', sent: 0 };
+    }
+    // Reading the call log needs a runtime permission that is granted from the Call logs tab.
+    const canReadCallLog = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.READ_CALL_LOG);
+    if (!canReadCallLog) {
+      return {
+        status: 'skipped',
+        message: 'Call log access is not allowed yet. Open the Call logs tab and tap "Grant permissions".',
+        sent: 0,
+      };
+    }
     const lastSyncedAt = await getLastSyncedAt();
     const minTs = lastSyncedAt ?? 0;
 
-    const callsToSend = await CallLogs.load(BATCH_LIMIT, {
+    const loaded = await CallLogs.load(BATCH_LIMIT, {
       minTimestamp: minTs,
     });
 
-    if (callsToSend.length === 0) return;
+    if (loaded.length === 0) {
+      return { status: 'nothing', message: 'No new calls since the last sync.', sent: 0 };
+    }
+    const newestTs = Math.max(...loaded.map(getCallTimeMs));
+
+    // "All call sync" off: only calls with CRM lead numbers are synced, and
+    // without a lead list we must not upload anything. On: every call is sent.
+    const allCallSync = await getAllCallSyncEnabled();
+    let callsToSend = loaded;
+    if (!allCallSync) {
+      const leadIndex = await getLeadPhoneIndex();
+      if (!leadIndex) {
+        console.log('[auto-sync] skipped: CRM lead list not available');
+        return { status: 'skipped', message: 'CRM lead list not available. Refresh leads and try again.', sent: 0 };
+      }
+      callsToSend = filterLeadCalls(leadIndex, loaded);
+      if (callsToSend.length === 0) {
+        // Nothing to sync in this window; move the cursor so these are not re-read.
+        await setLastSyncedAt(newestTs);
+        return { status: 'nothing', message: 'No new calls with CRM leads since the last sync.', sent: 0 };
+      }
+    }
 
     const syncOptions = await buildRecordingSyncOptions(callsToSend);
+    let lastMessage = 'Sync failed.';
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
       const result = await pushCallsToPortal(callsToSend, syncOptions, 'auto');
       if (result.success) {
-        const newestTs = Math.max(...callsToSend.map(getCallTimeMs));
         await setLastSyncedAt(newestTs);
-        return;
+        return {
+          status: 'synced',
+          message: `${callsToSend.length} call${callsToSend.length === 1 ? '' : 's'}${allCallSync ? '' : ' with leads'} sent to the CRM.`,
+          sent: callsToSend.length,
+        };
       }
+      lastMessage = result.message;
       if (attempt >= RETRY_DELAYS_MS.length) break;
       if (!(await isNetworkConnected())) break;
       await sleep(RETRY_DELAYS_MS[attempt]);
     }
-  } catch {
+    return { status: 'failed', message: lastMessage, sent: 0 };
+  } catch (e) {
     // Skip this run; next run will retry.
+    return { status: 'failed', message: e instanceof Error ? e.message : 'Sync failed.', sent: 0 };
   } finally {
     scheduledSyncInFlight = false;
   }

@@ -1,9 +1,7 @@
 declare module 'react-native-config' {
   export interface NativeConfig {
-    CALL_LOG_APP_KEY?: string;
-    CALL_LOG_SYNC_URL?: string;
-    CALL_LOG_UPLOAD_URL?: string;
-    CALL_LOG_AUTHORIZATION?: string;
+    /** Gaincafe CRM API base, e.g. https://whatsapp.gaincafe.com/api */
+    CRM_API_BASE_URL?: string;
   }
 
   const Config: NativeConfig;

@@ -40,14 +40,14 @@ function shortTokenFromFileName(fileName: string): string {
   return `rec${suffix}`;
 }
 
-function buildRecordingExternalId(call: CallLog, fileName: string, callTs: number): string {
+export function buildRecordingExternalId(call: CallLog, fileName: string, callTs: number): string {
   const phoneLast10 = normalizeDigits(call.phoneNumber || call.formattedNumber).slice(-10) || '0000000000';
   const callTime = formatCallTimeForExternalId(callTs);
   const shortFileToken = shortTokenFromFileName(fileName);
   return `${phoneLast10}-${callTime}-${shortFileToken}:${call.id}`;
 }
 
-function callTimeMs(c: CallLog): number {
+export function callTimeMs(c: CallLog): number {
   const raw = typeof c.timestamp === 'string' ? Number(c.timestamp) : c.timestamp;
   if (Number.isFinite(raw)) {
     return (raw as number) > 1e12 ? (raw as number) : (raw as number) * 1000;

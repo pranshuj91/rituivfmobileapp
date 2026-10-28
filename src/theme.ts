@@ -1,16 +1,16 @@
 /**
- * App theme – orange + white
+ * App theme – Gaincafe pink (#F95E77) + white
  */
 export const theme = {
   colors: {
-    primary: '#F97316',
-    primaryDark: '#EA580C',
-    primaryLight: '#FDBA74',
+    primary: '#F95E77',
+    primaryDark: '#E0435E',
+    primaryLight: '#FDB3C0',
     white: '#FFFFFF',
     background: '#FFFFFF',
-    backgroundSecondary: '#FFF7ED',
+    backgroundSecondary: '#FFF3F5',
     card: '#FFFFFF',
-    cardBorder: '#FFEDD5',
+    cardBorder: '#FFDCE3',
     text: '#1C1917',
     textSecondary: '#78716C',
     textOnPrimary: '#FFFFFF',

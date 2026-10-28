@@ -79,9 +79,9 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
-    namespace "com.rituivfmobileapp"
+    namespace "com.gaincafecrm"
     defaultConfig {
-        applicationId "com.rituivfmobileapp"
+        applicationId "com.gaincafecrm"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
@@ -110,6 +110,17 @@ android {
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+    // On Windows, ninja rejects any build path over 260 characters. The native
+    // (CMake) build embeds the full project path in every object file name, so
+    // a long project path makes the build fail. Keep the native build's staging
+    // directory short so CMake can shorten object names to fit.
+    if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+        externalNativeBuild {
+            cmake {
+                buildStagingDirectory = file("${System.getProperty('user.home')}/.cxx/gaincafecrm")
+            }
         }
     }
 }
