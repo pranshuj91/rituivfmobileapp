@@ -3,6 +3,8 @@ package com.gaincafecrm
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.util.Log
 import com.facebook.react.ReactApplication
@@ -85,18 +87,39 @@ object ShareIntentStore {
     emit(context, received)
   }
 
-  private fun emit(context: Context, files: List<SharedFile>) {
+  private const val EMIT_RETRY_MS = 1500L
+  private const val EMIT_MAX_TRIES = 12 // ~18 s, covers a cold start
+  private val mainHandler = Handler(Looper.getMainLooper())
+
+  /**
+   * Tells JS about the files. On a cold start the React context is not up yet,
+   * so retry for a while; JS also drains the store itself on mount, and the
+   * store only hands out each file once, so nothing is delivered twice.
+   */
+  private fun emit(context: Context, files: List<SharedFile>, attempt: Int = 0) {
     try {
-      val app = context.applicationContext as? ReactApplication ?: return
-      val reactContext = app.reactHost?.currentReactContext ?: return
+      val app = context.applicationContext as? ReactApplication
+      val reactContext = app?.reactHost?.currentReactContext
+      if (reactContext == null || !reactContext.hasActiveReactInstance()) {
+        if (attempt < EMIT_MAX_TRIES) {
+          mainHandler.postDelayed({ emit(context, files, attempt + 1) }, EMIT_RETRY_MS)
+        } else {
+          Log.d(TAG, "JS never became ready; files stay pending for getPendingShares()")
+        }
+        return
+      }
+      // Only announce files that JS has not already drained via getPendingShares().
+      val stillPending = synchronized(this) { files.filter { f -> pending.any { it.path == f.path } } }
+      if (stillPending.isEmpty()) return
       val array = Arguments.createArray()
-      files.forEach { array.pushMap(toMap(it)) }
+      stillPending.forEach { array.pushMap(toMap(it)) }
       reactContext
         .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
         .emit(EVENT_NAME, array)
+      synchronized(this) { pending.removeAll { f -> stillPending.any { it.path == f.path } } }
+      Log.d(TAG, "delivered ${stillPending.size} shared file(s) to JS")
     } catch (e: Exception) {
-      // JS not ready yet; getPendingShares() will pick the files up.
-      Log.d(TAG, "emit skipped: ${e.message}")
+      Log.d(TAG, "emit failed: ${e.message}")
     }
   }
 

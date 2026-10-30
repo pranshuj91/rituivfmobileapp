@@ -22,13 +22,23 @@ import {
   refreshLeadPhoneIndex,
 } from '../services/leadIndex';
 import { runScheduledSync } from '../services/syncSchedule';
+import { listRecordingFolders, type RecordingFolderInfo } from '../services/recordings';
+import {
+  BRAND_PROFILES,
+  deviceLabel,
+  dialerLabel,
+  getDeviceInfo as getPhoneInfo,
+  profileFor,
+  type BrandProfile,
+  type DeviceInfo,
+} from '../services/deviceProfile';
 import { getAllCallSyncEnabled, setAllCallSyncEnabled } from '../services/appSettings';
 import { AppDialog, type AppDialogProps } from '../components/AppDialog';
 import { theme } from '../theme';
 
 type DialogState = Omit<AppDialogProps, 'visible'>;
 
-const APP_VERSION = '1.0';
+const APP_VERSION = '1.0.2';
 const CRM_HOST = CRM_API_BASE_URL.replace(/^https?:\/\//, '').split('/')[0];
 
 /**
@@ -71,7 +81,7 @@ function DetailRow({ icon, label, value }: { icon: string; label: string; value:
       </View>
       <View style={styles.detailText}>
         <Text style={styles.detailLabel}>{label}</Text>
-        <Text style={styles.detailValue} numberOfLines={2}>{value}</Text>
+        <Text style={styles.detailValue} numberOfLines={4}>{value}</Text>
       </View>
     </View>
   );
@@ -88,6 +98,13 @@ export function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [lastSyncMs, setLastSyncMs] = useState<number | null>(null);
   const [leadCount, setLeadCount] = useState<number | null>(null);
+  const [recordingFolders, setRecordingFolders] = useState<RecordingFolderInfo[] | null>(null);
+  const [device, setDevice] = useState<DeviceInfo | null>(null);
+  const [showOtherPhones, setShowOtherPhones] = useState(false);
+
+  useEffect(() => {
+    getPhoneInfo().then(setDevice);
+  }, []);
   const [syncing, setSyncing] = useState(false);
   const [refreshingLeads, setRefreshingLeads] = useState(false);
   const [logoFailed, setLogoFailed] = useState(false);
@@ -102,6 +119,13 @@ export function SettingsScreen() {
   const onToggleAllCallSync = useCallback(async (value: boolean) => {
     setAllCallSync(value);
     await setAllCallSyncEnabled(value);
+    if (!value) {
+      // Back to lead-only mode: rebuild the lead-number list from the CRM so
+      // numbers that only exist because of earlier all-call syncs are gone.
+      await clearLeadPhoneIndex();
+      const index = await refreshLeadPhoneIndex();
+      setLeadCount(index ? Object.keys(index.byLast10).length : null);
+    }
   }, []);
 
   const refreshStatus = useCallback(async () => {
@@ -111,6 +135,8 @@ export function SettingsScreen() {
     ]);
     setLastSyncMs(last);
     setLeadCount(index ? Object.keys(index.byLast10).length : null);
+    // Which dialer/recorder folders on this phone hold recordings (brand check).
+    listRecordingFolders().then(setRecordingFolders).catch(() => setRecordingFolders([]));
   }, []);
 
   useEffect(() => {
@@ -317,6 +343,20 @@ export function SettingsScreen() {
             value={leadCount == null ? 'not loaded' : String(leadCount)}
           />
           <DetailRow
+            icon={recordingFolders && recordingFolders.length > 0 ? 'folder-music-outline' : 'folder-off-outline'}
+            label="Call recording folder"
+            value={
+              recordingFolders == null
+                ? 'checking…'
+                : recordingFolders.length === 0
+                  ? 'None found. Turn on call recording in your phone\'s dialer, or use Share to Gaincafe CRM.'
+                  : recordingFolders
+                      .slice(0, 2)
+                      .map((f) => `${f.relativePath} (${f.files} file${f.files === 1 ? '' : 's'})`)
+                      .join('\n')
+            }
+          />
+          <DetailRow
             icon={workspaceLogo ? 'image-outline' : 'image-off-outline'}
             label="Brand logo"
             value={
@@ -356,6 +396,63 @@ export function SettingsScreen() {
             </TouchableOpacity>
           </View>
         </View>
+
+        {/* Call recording on this phone */}
+        {device ? (() => {
+          const profile: BrandProfile = profileFor(device);
+          const hasFolder = !!recordingFolders && recordingFolders.length > 0;
+          return (
+            <View style={styles.card}>
+              <View style={styles.toggleRow}>
+                <View style={styles.toggleIcon}>
+                  <Icon name="record-rec" size={22} color={theme.colors.primary} />
+                </View>
+                <View style={styles.toggleText}>
+                  <Text style={styles.toggleTitle}>Call recording on this phone</Text>
+                  <Text style={styles.toggleHint}>
+                    {deviceLabel(device)} · {dialerLabel(device.dialer)}
+                  </Text>
+                </View>
+              </View>
+              <View style={styles.chipsRowLeft}>
+                <Chip
+                  label={profile.mode === 'auto' ? 'Automatic from folder' : 'Share after call'}
+                  on={profile.mode === 'auto'}
+                />
+                <Chip label={hasFolder ? 'Recordings found' : 'No recordings yet'} on={hasFolder} />
+              </View>
+              <Text style={styles.stepsTitle}>{profile.brands}: {profile.dialer}</Text>
+              {profile.steps.map((step, i) => (
+                <View key={i} style={styles.stepRow}>
+                  <View style={styles.stepNum}>
+                    <Text style={styles.stepNumText}>{i + 1}</Text>
+                  </View>
+                  <Text style={styles.stepText}>{step}</Text>
+                </View>
+              ))}
+              <Text style={styles.folderHint}>Recordings folder: {profile.folder}</Text>
+              <TouchableOpacity style={styles.otherToggle} onPress={() => setShowOtherPhones((v) => !v)}>
+                <Text style={styles.otherToggleText}>Other phones</Text>
+                <Icon
+                  name={showOtherPhones ? 'chevron-up' : 'chevron-down'}
+                  size={20}
+                  color={theme.colors.primary}
+                />
+              </TouchableOpacity>
+              {showOtherPhones
+                ? BRAND_PROFILES.filter((p) => p.key !== profile.key && p.key !== 'other').map((p) => (
+                    <View key={p.key} style={styles.otherRow}>
+                      <Text style={styles.otherBrand}>{p.brands}</Text>
+                      <Text style={styles.otherDialer}>
+                        {p.dialer}{p.builtIn ? ' (built-in)' : ''} · {p.mode === 'auto' ? 'automatic' : 'share after call'}
+                      </Text>
+                      <Text style={styles.otherStep}>{p.steps[0]} {p.steps[1] ?? ''}</Text>
+                    </View>
+                  ))
+                : null}
+            </View>
+          );
+        })() : null}
 
         {/* Call sync mode */}
         <View style={styles.card}>
@@ -651,6 +748,85 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: theme.spacing.sm + 4,
+  },
+  chipsRowLeft: {
+    flexDirection: 'row',
+    gap: theme.spacing.sm,
+    marginTop: theme.spacing.md,
+    flexWrap: 'wrap',
+  },
+  stepsTitle: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: theme.colors.text,
+    marginTop: theme.spacing.md,
+    marginBottom: theme.spacing.sm,
+  },
+  stepRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: theme.spacing.sm,
+    marginBottom: theme.spacing.sm,
+  },
+  stepNum: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: theme.colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 1,
+  },
+  stepNumText: {
+    color: theme.colors.textOnPrimary,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  stepText: {
+    flex: 1,
+    fontSize: 13,
+    color: theme.colors.textSecondary,
+    lineHeight: 19,
+  },
+  folderHint: {
+    fontSize: 12,
+    color: theme.colors.tabInactive,
+    marginTop: theme.spacing.xs,
+  },
+  otherToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: theme.spacing.md,
+    paddingTop: theme.spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: theme.colors.cardBorder,
+  },
+  otherToggleText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: theme.colors.primary,
+  },
+  otherRow: {
+    paddingVertical: theme.spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.colors.cardBorder,
+  },
+  otherBrand: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: theme.colors.text,
+  },
+  otherDialer: {
+    fontSize: 12,
+    color: theme.colors.primaryDark,
+    marginTop: 2,
+  },
+  otherStep: {
+    fontSize: 12,
+    color: theme.colors.textSecondary,
+    lineHeight: 17,
+    marginTop: 2,
   },
   toggleIcon: {
     width: 40,

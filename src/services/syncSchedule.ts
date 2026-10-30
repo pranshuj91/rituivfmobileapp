@@ -15,6 +15,7 @@ import NetInfo from '@react-native-community/netinfo';
 import {
   getLastSyncedAt,
   pushCallsToPortal,
+  flushPendingSyncQueue,
   setLastSyncedAt,
 } from './portal';
 import { buildRecordingSyncOptions } from './recordings';
@@ -96,6 +97,14 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
         sent: 0,
       };
     }
+    // First drain anything queued from an earlier run (offline, timeout, app
+    // killed mid-sync). This must not depend on there being new calls.
+    const flushed = await flushPendingSyncQueue();
+    if (flushed) {
+      console.log('[auto-sync] queued batches', { success: flushed.success, message: flushed.message });
+    }
+    const queuedNote = flushed?.success ? ' Queued calls from earlier were sent.' : '';
+
     const lastSyncedAt = await getLastSyncedAt();
     const minTs = lastSyncedAt ?? 0;
 
@@ -104,7 +113,10 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
     });
 
     if (loaded.length === 0) {
-      return { status: 'nothing', message: 'No new calls since the last sync.', sent: 0 };
+      if (flushed && !flushed.success) {
+        return { status: 'failed', message: flushed.message, sent: 0 };
+      }
+      return { status: 'nothing', message: `No new calls since the last sync.${queuedNote}`, sent: 0 };
     }
     const newestTs = Math.max(...loaded.map(getCallTimeMs));
 
@@ -122,7 +134,7 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
       if (callsToSend.length === 0) {
         // Nothing to sync in this window; move the cursor so these are not re-read.
         await setLastSyncedAt(newestTs);
-        return { status: 'nothing', message: 'No new calls with CRM leads since the last sync.', sent: 0 };
+        return { status: 'nothing', message: `No new calls with CRM leads since the last sync.${queuedNote}`, sent: 0 };
       }
     }
 

@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Image,
@@ -23,6 +23,7 @@ import { getAllCallSyncEnabled } from '../services/appSettings';
 import { getLastSyncedAt, getSyncedCallIds } from '../services/portal';
 import { runScheduledSync } from '../services/syncSchedule';
 import { AppDialog, type AppDialogProps } from '../components/AppDialog';
+import { getDeviceInfo, profileFor, type RecordingMode } from '../services/deviceProfile';
 import { theme } from '../theme';
 
 type DialogState = Omit<AppDialogProps, 'visible'>;
@@ -123,6 +124,12 @@ export function HomeScreen() {
   const [syncing, setSyncing] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const closeDialog = useCallback(() => setDialog(null), []);
+  const [recordingMode, setRecordingMode] = useState<RecordingMode | null>(null);
+
+  useEffect(() => {
+    // Google Phone devices cannot expose recordings; remind the agent to share them.
+    getDeviceInfo().then((info) => setRecordingMode(profileFor(info).mode));
+  }, []);
 
   const loadCalls = useCallback(async (
     index: LeadPhoneIndex | null,
@@ -348,6 +355,16 @@ export function HomeScreen() {
               </TouchableOpacity>
             </View>
 
+            {recordingMode === 'share' ? (
+              <TouchableOpacity style={[styles.card, styles.nudgeCard]} onPress={() => navigation.navigate('Settings')}>
+                <Icon name="share-variant-outline" size={22} color={theme.colors.primary} />
+                <Text style={styles.cardText}>
+                  This phone's dialer keeps recordings private. After a call, share the recording from the Phone app to <Text style={styles.bold}>Gaincafe CRM</Text>. Steps are in Settings.
+                </Text>
+                <Icon name="chevron-right" size={22} color={theme.colors.tabInactive} />
+              </TouchableOpacity>
+            ) : null}
+
             {/* Permission nudge */}
             {hasCallPermission === false ? (
               <TouchableOpacity style={[styles.card, styles.nudgeCard]} onPress={() => navigation.navigate('CallLogs')}>
@@ -433,7 +450,7 @@ export function HomeScreen() {
                           size={12}
                           color={c.synced ? theme.colors.success : '#D97706'}
                         />
-                        <Text style={[styles.syncPillText, { color: c.synced ? theme.colors.success : '#D97706' }]}>
+                        <Text style={[styles.syncPillText, c.synced ? styles.syncPillTextOn : styles.syncPillTextOff]}>
                           {c.synced ? 'Synced' : 'Pending'}
                         </Text>
                       </View>
@@ -703,6 +720,12 @@ const styles = StyleSheet.create({
   syncPillText: {
     fontSize: 11,
     fontWeight: '700',
+  },
+  syncPillTextOn: {
+    color: theme.colors.success,
+  },
+  syncPillTextOff: {
+    color: '#D97706',
   },
   emptyRow: {
     flexDirection: 'row',

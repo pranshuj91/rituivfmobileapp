@@ -1,14 +1,30 @@
 package com.gaincafecrm
 
-import com.facebook.react.ReactPackage
+import com.facebook.react.TurboReactPackage
 import com.facebook.react.bridge.NativeModule
 import com.facebook.react.bridge.ReactApplicationContext
-import com.facebook.react.uimanager.ViewManager
+import com.facebook.react.module.model.ReactModuleInfo
+import com.facebook.react.module.model.ReactModuleInfoProvider
 
-class ShareReceiverPackage : ReactPackage {
-  override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
-    listOf(ShareReceiverModule(reactContext))
+/**
+ * Registers ShareReceiver so it is reachable as NativeModules.ShareReceiver under
+ * the new architecture (bridgeless) through the legacy-module interop layer.
+ */
+class ShareReceiverPackage : TurboReactPackage() {
+  override fun getModule(name: String, reactContext: ReactApplicationContext): NativeModule? =
+    if (name == ShareReceiverModule.NAME) ShareReceiverModule(reactContext) else null
 
-  override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
-    emptyList()
+  override fun getReactModuleInfoProvider(): ReactModuleInfoProvider =
+    ReactModuleInfoProvider {
+      mapOf(
+        ShareReceiverModule.NAME to ReactModuleInfo(
+          ShareReceiverModule.NAME,
+          ShareReceiverModule::class.java.name,
+          false, // canOverrideExistingModule
+          false, // needsEagerInit
+          false, // isCxxModule
+          false, // isTurboModule (legacy module, served through interop)
+        )
+      )
+    }
 }

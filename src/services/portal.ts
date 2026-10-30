@@ -52,13 +52,38 @@ async function markCallsSynced(ids: string[]): Promise<void> {
 const uploadedRecordingsByCallId = new Map<string, Array<Record<string, unknown>>>();
 const uploadedRecordingUrlByExternalId = new Map<string, string>();
 const STRICT_PAIR_WINDOW_MS = 120 * 1000;
-const UPLOAD_TIMEOUT_MS = 25 * 1000;
+const UPLOAD_TIMEOUT_MS = 60 * 1000;
 const SYNC_TIMEOUT_MS = 60 * 1000;
+/** How many calls have their recordings uploaded at the same time during a big push. */
+const UPLOAD_CONCURRENCY = 3;
+
+/** Like Promise.all(items.map(fn)) but never runs more than `limit` fn calls at once. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next;
+      next += 1;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 const DUPLICATE_SYNC_WINDOW_MS = 30 * 1000;
 const SAME_LOGS_RECORDING_DROP_WINDOW_MS = 2 * 60 * 1000;
 const MAX_PENDING_SYNC_BATCHES = 96;
+/** CRM limit: POST /api/call-logs/sync accepts up to 100 logs per request. */
+const MAX_LOGS_PER_BATCH = 100;
 const MAX_FAILED_SYNC_BATCHES = 200;
 const MAX_BATCH_ATTEMPTS = 16;
+/** A batch the CRM rejected as invalid is kept in the failed archive this long before any retry. */
+const REJECTED_BATCH_PARK_MS = 7 * 24 * 60 * 60 * 1000;
 const RETRY_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000, 120_000];
 const EVICTED_BATCH_RETRY_DELAY_MS = 30 * 60 * 1000;
 let syncRequestInFlight = false;
@@ -301,6 +326,8 @@ async function postSyncPayload(
   message: string;
   count?: number;
   results?: PushResult['results'];
+  /** true when the CRM rejected the payload itself (400/413/422): resending it cannot help */
+  permanent?: boolean;
 }> {
   const controller = new AbortController();
   const syncTimeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
@@ -325,7 +352,8 @@ async function postSyncPayload(
     const msg = details
       ? `Portal responded with ${res.status}: ${details}`
       : `Portal responded with ${res.status}`;
-    return { ok: false, message: msg };
+    const permanent = res.status === 400 || res.status === 413 || res.status === 422;
+    return { ok: false, message: msg, permanent };
   }
   let apiMessage = `${payload.logs.length} call(s) pushed to portal.`;
   let savedCount = payload.logs.length;
@@ -363,6 +391,8 @@ async function flushPendingSyncBatches(
   };
   let processedAny = false;
   let progressed = true;
+  let rejectedBatches = 0;
+  let rejectedMessage = '';
   while (batches.length > 0 && progressed) {
     progressed = false;
     for (let index = 0; index < batches.length; index += 1) {
@@ -376,6 +406,33 @@ async function flushPendingSyncBatches(
       const before = batches.slice(0, index);
       const after = batches.slice(index + 1);
 
+      // A queued batch may predate a toggle change. Re-apply the current rule:
+      // with "All call sync" off, only calls with CRM lead numbers may leave the phone.
+      const allCallSyncNow = await getAllCallSyncEnabled();
+      let payloadToSend: SyncPayload = { ...current.payload, create_unmatched_leads: allCallSyncNow };
+      if (!allCallSyncNow) {
+        const leadIndexNow = await getLeadPhoneIndex();
+        const keptLogs = current.payload.logs.filter((l) => {
+          const key = normalizeDigits(String(l.phone_number ?? '')).slice(-10);
+          return key.length === 10 && !!leadIndexNow && !!leadIndexNow.byLast10[key];
+        });
+        if (keptLogs.length === 0) {
+          console.log('[sync-queue] dropped queued batch: no lead calls left', { batchId: current.id });
+          batches = [...before, ...after];
+          await setPendingSyncBatches(batches);
+          index -= 1;
+          continue;
+        }
+        if (keptLogs.length !== current.payload.logs.length) {
+          console.log('[sync-queue] trimmed queued batch to lead calls', {
+            batchId: current.id,
+            before: current.payload.logs.length,
+            after: keptLogs.length,
+          });
+          payloadToSend = { ...payloadToSend, logs: keptLogs };
+        }
+      }
+
       const updateQueueAndReturn = async (
         replacement: PendingSyncBatch | null,
         result: PushResult
@@ -385,9 +442,27 @@ async function flushPendingSyncBatches(
         return result;
       };
 
-    const posted = await postSyncPayload(current.payload, headers);
+    const posted = await postSyncPayload(payloadToSend, headers);
     if (!posted.ok) {
       const nextAttempts = current.attempts + 1;
+      if (posted.permanent) {
+        // Validation error: the same payload will fail every time. Park it in the
+        // failed archive and keep going with the other batches instead of blocking them.
+        console.warn('[sync-queue] batch rejected by CRM, archived', { batchId: current.id, error: posted.message });
+        await moveBatchToFailedArchive({
+          ...current,
+          attempts: nextAttempts,
+          // Parked, not retried: the requeue only picks batches whose nextRetryAt has passed.
+          nextRetryAt: Date.now() + REJECTED_BATCH_PARK_MS,
+          lastError: posted.message,
+        });
+        batches = [...before, ...after];
+        await setPendingSyncBatches(batches);
+        rejectedBatches += 1;
+        rejectedMessage = posted.message;
+        index -= 1;
+        continue;
+      }
       if (nextAttempts >= MAX_BATCH_ATTEMPTS) {
         const terminalFailed: PendingSyncBatch = {
           ...current,
@@ -491,6 +566,13 @@ async function flushPendingSyncBatches(
       message: `Retry scheduled in ${Math.ceil((nextDueMs - Date.now()) / 1000)}s.`,
     };
   }
+  if (rejectedBatches > 0) {
+    return {
+      ...lastSuccess,
+      success: false,
+      message: `${rejectedBatches} batch(es) rejected by the CRM and skipped. ${rejectedMessage}`,
+    };
+  }
   return lastSuccess;
 }
 
@@ -541,9 +623,20 @@ export function toCalledAt(c: CallLog): string {
   return date.toISOString().slice(0, 19).replace('T', ' ');
 }
 
+/**
+ * Maps the device call type to the directions the CRM understands.
+ * Some phones report VoWiFi calls as WIFI_INCOMING / WIFI_OUTGOING.
+ */
 function toDirection(type?: string): string {
   if (!type) return 'UNKNOWN';
-  return String(type).toUpperCase();
+  const t = String(type).toUpperCase();
+  if (t.includes('MISSED')) return 'MISSED';
+  if (t.includes('REJECTED')) return 'REJECTED';
+  if (t.includes('BLOCKED')) return 'BLOCKED';
+  if (t.includes('VOICEMAIL')) return 'VOICEMAIL';
+  if (t.includes('INCOMING')) return 'INCOMING';
+  if (t.includes('OUTGOING')) return 'OUTGOING';
+  return t;
 }
 
 function toRecordingSingle(r?: RecordingPayload): Record<string, unknown> {
@@ -687,7 +780,7 @@ async function uploadRecordingIfNeeded(
     const filename = filePath.split('/').pop() || 'recording.mp3';
     // Multipart upload: auth headers only, no JSON content type.
     const uploadHeaders: Record<string, string> = { ...authHeaders };
-    const uploadPromise = RNFS.uploadFiles({
+    const uploadJob = RNFS.uploadFiles({
       toUrl: RECORDING_UPLOAD_URL,
       files: [
         {
@@ -703,13 +796,27 @@ async function uploadRecordingIfNeeded(
         recording_external_id: String(recording.recording_external_id ?? ''),
         source: String(recording.source ?? 'mobile_app'),
       },
-    }).promise;
+    });
 
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
     const uploadRes = await Promise.race([
-      uploadPromise,
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), UPLOAD_TIMEOUT_MS)),
-    ]);
-    if (!uploadRes) return null;
+      uploadJob.promise,
+      new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), UPLOAD_TIMEOUT_MS);
+      }),
+    ]).finally(() => {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    });
+    if (!uploadRes) {
+      // Stop the native upload so it does not keep eating bandwidth behind the next ones.
+      try {
+        RNFS.stopUpload(uploadJob.jobId);
+      } catch {
+        // ignore
+      }
+      console.warn('[upload] recording upload timed out', { callId, externalId });
+      return null;
+    }
 
     if (uploadRes.statusCode < 200 || uploadRes.statusCode >= 300) {
       return null;
@@ -824,7 +931,9 @@ export async function pushCallsToPortal(
       'Content-Type': 'application/json',
     };
 
-    const logsBase = await Promise.all(callsForPayload.map(async (c) => {
+    // Bounded concurrency: a big "Push to portal" can carry hundreds of calls, and
+    // firing every recording upload at once makes them time out on mobile data.
+    const logsBase = await mapWithConcurrency(callsForPayload, UPLOAD_CONCURRENCY, async (c) => {
       const singleRec = toRecordingSingle(options.singleRecordingByCallId?.[c.id]);
       const recordings = toRecordingArray(options.recordingsByCallId?.[c.id]);
       // Send a single unified recordings[] array to avoid duplicate payload forms.
@@ -848,7 +957,7 @@ export async function pushCallsToPortal(
         duration_seconds: c.duration,
         called_at: calledAt,
       };
-    }));
+    });
 
     const uploadSucceededCount = Array.from(uploadedRecordingsByCallId.values()).reduce(
       (acc, list) => acc + list.length,
@@ -1031,15 +1140,14 @@ export async function pushCallsToPortal(
       : undefined;
     const latestCallPayloadRecordings = latestCallLogEntry?.recordings?.length ?? 0;
     if (latestCallRequestedRecordings > 0 && latestCallPayloadRecordings === 0) {
-      console.error('[sync-block] latest call expected recording but payload has none', {
+      // Usually the recording upload timed out or the file is still being written by
+      // the dialer. The call log still goes up; the recording is retried on the next
+      // sync (the file scan overlaps the previous sync window by 10 minutes).
+      console.warn('[sync-warn] latest call had a recording candidate but none was attached', {
         latestCallId,
         latestCallRequestedRecordings,
         latestCallPayloadRecordings,
       });
-      return {
-        success: false,
-        message: 'Latest call has recording candidate, but payload recordings are empty. Sync blocked.',
-      };
     }
     console.log('[sync-payload] logs[0].recordings?.length =', (payload.logs[0] as { recordings?: unknown[] } | undefined)?.recordings?.length ?? 0);
     console.log('[sync-payload] first 2 logs =', payload.logs.slice(0, 2));
@@ -1052,16 +1160,37 @@ export async function pushCallsToPortal(
       console.log('[sync-payload] no non-empty recordings before /sync (expected if batch has no matched files)');
     }
     console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
-    await enqueuePendingSyncBatch({
-      id: makeDeterministicBatchId(syncSignature) || makeBatchId(),
-      signature: syncSignature,
-      priority: syncMode === 'manual' ? 'high' : 'normal',
-      recordingItems: totalRecordingItems,
-      createdAt: Date.now(),
-      attempts: 0,
-      nextRetryAt: Date.now(),
-      payload,
-    });
+    // The CRM accepts at most MAX_LOGS_PER_BATCH logs per request, so a large
+    // "Push to portal" is split into several queued batches sent one after another.
+    const chunks: SyncPayloadLog[][] = [];
+    for (let i = 0; i < payload.logs.length; i += MAX_LOGS_PER_BATCH) {
+      chunks.push(payload.logs.slice(i, i + MAX_LOGS_PER_BATCH));
+    }
+    for (const chunkLogs of chunks) {
+      const chunkSignature = chunkLogs
+        .map((l) => {
+          const recIds = (l.recordings ?? [])
+            .map((r) => String(r.recording_external_id ?? ''))
+            .filter(Boolean)
+            .sort()
+            .join(',');
+          return `${String(l.callId || l.id || '')}|${String(l.called_at || '')}|${recIds}`;
+        })
+        .join('||');
+      await enqueuePendingSyncBatch({
+        id: makeDeterministicBatchId(chunkSignature) || makeBatchId(),
+        signature: chunkSignature,
+        priority: syncMode === 'manual' ? 'high' : 'normal',
+        recordingItems: chunkLogs.reduce((acc, l) => acc + (l.recordings?.length ?? 0), 0),
+        createdAt: Date.now(),
+        attempts: 0,
+        nextRetryAt: Date.now(),
+        payload: { ...payload, logs: chunkLogs },
+      });
+    }
+    if (chunks.length > 1) {
+      console.log('[sync-payload] split into batches', { batches: chunks.length, total: payload.logs.length });
+    }
     return flushPendingSyncBatches(headers);
   } catch (e) {
     const isAbort = e instanceof Error && e.name === 'AbortError';
@@ -1074,6 +1203,30 @@ export async function pushCallsToPortal(
   } finally {
     // Keep map until sync call has executed, then clear.
     uploadedRecordingsByCallId.clear();
+    syncRequestInFlight = false;
+  }
+}
+
+/**
+ * Send batches that were queued earlier (offline, timeout, app killed mid-sync)
+ * without needing new calls. Returns null when the queue is empty.
+ */
+export async function flushPendingSyncQueue(): Promise<PushResult | null> {
+  const pending = await getPendingSyncBatches();
+  const failed = await getFailedSyncBatches();
+  const hasDue = pending.length > 0 || failed.some((b) => b.nextRetryAt <= Date.now());
+  if (!hasDue) return null;
+  if (syncRequestInFlight) {
+    return { success: false, message: 'Sync already in progress.' };
+  }
+  syncRequestInFlight = true;
+  try {
+    const headers = await getAuthHeaders();
+    console.log('[sync-queue] flushing queued batches', { pending: pending.length });
+    return await flushPendingSyncBatches(headers);
+  } catch (e) {
+    return { success: false, message: e instanceof Error ? e.message : 'Network error' };
+  } finally {
     syncRequestInFlight = false;
   }
 }

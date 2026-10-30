@@ -78,3 +78,6 @@ yarn-error.log
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+
+# Play upload signing (never commit)
+android/keystore.properties

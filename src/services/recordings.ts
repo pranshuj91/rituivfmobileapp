@@ -178,16 +178,30 @@ async function collectFromDir(
   }
 }
 
-async function collectCandidateRecordings(): Promise<Array<{ path: string; name: string; mtimeMs: number }>> {
+/**
+ * Folders where phone dialers and recorder apps save call recordings.
+ * Scanned up to 3 levels deep, so "Music/Recordings/Call Recordings" is covered by "Music".
+ */
+export function candidateRecordingDirs(): string[] {
   const base = RNFS.ExternalStorageDirectoryPath;
-  const dirs = [
+  return [
+    // Samsung Phone, Vivo/iQOO, HyperOS, generic
     `${base}/Recordings`,
     `${base}/Call`,
     `${base}/CallRecordings`,
     `${base}/CallRecord`,
+    `${base}/Call Recordings`,
     `${base}/PhoneRecord`,
+    `${base}/Record`,
+    `${base}/Record/Call`,
+    `${base}/Record/PhoneRecord`,
     `${base}/Sounds`,
+    // Oppo / Realme / OnePlus (ODialer): Music/Recordings/Call Recordings
     `${base}/Music`,
+    // Xiaomi / Redmi / POCO (MIUI)
+    `${base}/MIUI/sound_recorder/call_rec`,
+    `${base}/MIUI/sound_recorder`,
+    // Dialer app media folders
     `${base}/Android/media/com.google.android.dialer/CallRecordings`,
     `${base}/Android/media/com.android.dialer/CallRecordings`,
     `${base}/Android/media/com.oplus.dialer/CallRecordings`,
@@ -199,12 +213,65 @@ async function collectCandidateRecordings(): Promise<Array<{ path: string; name:
     `${base}/Android/media/com.coloros.soundrecorder`,
     `${base}/Android/media/com.coloros.soundrecorder/Recordings`,
     `${base}/Android/media/com.oplus.soundrecorder/Recordings`,
-    `${base}/MIUI/sound_recorder/call_rec`,
+    `${base}/Android/media/com.samsung.android.dialer`,
+    `${base}/Android/media/com.vivo.dialer`,
+    `${base}/Android/media/com.android.incallui`,
+    // Cube ACR (third-party recorder for Google Phone devices)
+    `${base}/CubeCallRecorder`,
+    `${base}/CubeCallRecorder/All`,
+    `${base}/Android/media/com.catalinagroup.callrecorder`,
+    `${base}/Android/media/com.catalinagroup.callrecorder/CubeCallRecorder`,
   ];
+}
 
-  const out: Array<{ path: string; name: string; mtimeMs: number }> = [];
-  for (const d of dirs) {
+export interface RecordingFolderInfo {
+  /** Path relative to the storage root, e.g. "Music/Recordings/Call Recordings" */
+  relativePath: string;
+  files: number;
+  newestMs: number;
+}
+
+/** Folders on this phone that actually contain audio files, newest first. Used by Settings. */
+export async function listRecordingFolders(): Promise<RecordingFolderInfo[]> {
+  const base = RNFS.ExternalStorageDirectoryPath;
+  const byDir = new Map<string, { files: number; newestMs: number }>();
+  for (const d of candidateRecordingDirs()) {
+    const out: Array<{ path: string; name: string; mtimeMs: number }> = [];
     await collectFromDir(d, 3, out);
+    for (const f of out) {
+      const dir = f.path.slice(0, f.path.lastIndexOf('/'));
+      const entry = byDir.get(dir) ?? { files: 0, newestMs: 0 };
+      entry.files += 1;
+      entry.newestMs = Math.max(entry.newestMs, f.mtimeMs);
+      byDir.set(dir, entry);
+    }
+  }
+  return Array.from(byDir.entries())
+    .map(([dir, info]) => ({
+      relativePath: dir.startsWith(base) ? dir.slice(base.length + 1) : dir,
+      files: info.files,
+      newestMs: info.newestMs,
+    }))
+    // Call-recording folders first (by name), then whatever has the newest audio.
+    .sort((a, b) => {
+      const aCall = /call|phonerecord|cube/i.test(a.relativePath) ? 1 : 0;
+      const bCall = /call|phonerecord|cube/i.test(b.relativePath) ? 1 : 0;
+      return bCall - aCall || b.newestMs - a.newestMs;
+    });
+}
+
+async function collectCandidateRecordings(): Promise<Array<{ path: string; name: string; mtimeMs: number }>> {
+  const out: Array<{ path: string; name: string; mtimeMs: number }> = [];
+  const seen = new Set<string>();
+  for (const d of candidateRecordingDirs()) {
+    const found: Array<{ path: string; name: string; mtimeMs: number }> = [];
+    await collectFromDir(d, 3, found);
+    for (const f of found) {
+      // Nested candidate dirs (e.g. Music and Music/Recordings) must not list a file twice.
+      if (seen.has(f.path)) continue;
+      seen.add(f.path);
+      out.push(f);
+    }
   }
   return out;
 }
@@ -214,7 +281,12 @@ export async function buildRecordingSyncOptions(calls: CallLog[]): Promise<SyncO
     const allFiles = await collectCandidateRecordings();
     if (allFiles.length === 0 || calls.length === 0) return {};
     const lastSyncedAt = await getLastSyncedAt();
-    const minFileTs = lastSyncedAt ? lastSyncedAt - RECENT_FILE_BUFFER_MS : 0;
+    // Look back to the oldest call being pushed, not only to the last sync: a manual
+    // "Push to portal" of older calls must still find their recordings.
+    const callTimes = calls.map(callTimeMs).filter((t) => t > 0);
+    const oldestCallTs = callTimes.length > 0 ? Math.min(...callTimes) : 0;
+    const sinceLastSync = lastSyncedAt ? lastSyncedAt - RECENT_FILE_BUFFER_MS : 0;
+    const minFileTs = Math.max(0, Math.min(sinceLastSync, oldestCallTs > 0 ? oldestCallTs - RECENT_FILE_BUFFER_MS : sinceLastSync));
     let files = allFiles.filter((f) => preferredFileTimeMs(f) >= minFileTs);
     // Some dialers report stale mtime/parsed timestamps; fallback to last 24h scope for discovery.
     if (files.length === 0) {

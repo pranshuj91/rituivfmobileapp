@@ -21,9 +21,15 @@ interface ShareReceiverNative {
 
 const EVENT_NAME = 'GaincafeShareReceived';
 
+let warnedMissing = false;
+
 function native(): ShareReceiverNative | null {
   if (Platform.OS !== 'android') return null;
   const mod = (NativeModules as { ShareReceiver?: ShareReceiverNative }).ShareReceiver;
+  if (!mod && !warnedMissing) {
+    warnedMissing = true;
+    console.warn('[share] ShareReceiver native module not found; relying on events only');
+  }
   return mod ?? null;
 }
 
