@@ -38,9 +38,21 @@ export interface LeadPhoneIndex {
 let memory: LeadPhoneIndex | null | undefined; // undefined = not loaded from storage yet
 let refreshInFlight: Promise<LeadPhoneIndex | null> | null = null;
 
+/** Last 10 digits of a phone number; empty for anything shorter (112, USSD codes, short codes). */
 export function phoneKey(input?: string | null): string {
   const digits = (input ?? '').replace(/\D/g, '');
-  return digits.length >= 10 ? digits.slice(-10) : digits;
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+/**
+ * Leads that the call sync itself auto-created and nobody has touched since
+ * (lead_source "call_sync", status still "new"). With "All call sync" off these
+ * must not count as leads, otherwise every number ever synced by mistake keeps
+ * syncing forever.
+ */
+export function isCallSyncArtifact(lead: Pick<Lead, 'lead_source' | 'status'>): boolean {
+  const source = (lead.lead_source || '').toLowerCase().replace(/[\s-]+/g, '_');
+  return source === 'call_sync' && (lead.status || '') === 'new';
 }
 
 function callPhoneKey(call: CallLog): string {
@@ -93,10 +105,11 @@ export async function addLeadsToIndex(leads: Lead[]): Promise<void> {
   const existing = (await loadFromStorage()) ?? { byLast10: {}, fetchedAt: 0, complete: false };
   const byLast10 = { ...existing.byLast10 };
   for (const lead of leads) {
+    if (isCallSyncArtifact(lead)) continue;
     const ref = toRef(lead);
     for (const p of [lead.phone, lead.alternate_phone]) {
       const key = phoneKey(p);
-      if (key.length >= 7) byLast10[key] = ref;
+      if (key) byLast10[key] = ref;
     }
   }
   await persist({ ...existing, byLast10 });
@@ -116,6 +129,7 @@ export async function refreshLeadPhoneIndex(): Promise<LeadPhoneIndex | null> {
     const sourceCounts: Record<string, number> = {};
     let fieldNames: string[] = [];
     let tagSample: unknown;
+    let skippedArtifacts = 0;
     try {
       do {
         const result = await fetchLeads({ page, perPage: PAGE_SIZE, status: [] });
@@ -129,10 +143,14 @@ export async function refreshLeadPhoneIndex(): Promise<LeadPhoneIndex | null> {
           if (tagSample === undefined && (raw.tags != null || raw.labels != null)) {
             tagSample = raw.tags ?? raw.labels;
           }
+          if (isCallSyncArtifact(lead)) {
+            skippedArtifacts += 1;
+            continue;
+          }
           const ref = toRef(lead);
           for (const p of [lead.phone, lead.alternate_phone]) {
             const key = phoneKey(p);
-            if (key.length >= 7) byLast10[key] = ref;
+            if (key) byLast10[key] = ref;
           }
         }
         lastPage = result.lastPage;
@@ -152,7 +170,7 @@ export async function refreshLeadPhoneIndex(): Promise<LeadPhoneIndex | null> {
     }
     const index: LeadPhoneIndex = { byLast10, fetchedAt: Date.now(), complete };
     await persist(index);
-    console.log('[lead-index] refreshed', { leads: Object.keys(byLast10).length, complete });
+    console.log('[lead-index] refreshed', { leads: Object.keys(byLast10).length, complete, skippedArtifacts });
     console.log('[lead-index] lead shape', JSON.stringify({ fieldNames, statusCounts, sourceCounts, tagSample }));
     // Diagnostics: leads that were created by call sync itself (source call_sync / Call),
     // which make later calls to those numbers count as "lead calls".

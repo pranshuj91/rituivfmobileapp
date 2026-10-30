@@ -336,8 +336,10 @@ export function CallLogsScreen() {
       setPushingId('all');
       const syncOptions = await buildRecordingSyncOptions(logs);
       const result = await pushCallsToPortal(logs, syncOptions, 'manual');
+      // The CRM acknowledges logs per batch; read back exactly which ones it
+      // accepted instead of marking everything as synced on success.
+      setSyncedIds(await getSyncedCallIds());
       if (result.success) {
-        setSyncedIds((prev) => new Set([...prev, ...logs.map((l) => l.id)]));
         const now = Date.now();
         await setLastSyncedAt(now);
         setLastSyncedAtMs(now);
