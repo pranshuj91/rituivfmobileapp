@@ -12,6 +12,14 @@
 - 30 Oct 4:52 PM: Internal testing release "3 (1.0.2)" published, "Available to internal testers". Share ke liye Play Console → App bundle explorer → 3.aab → Downloads → "Signed, universal APK" lo (Google key se signed, Play app ke saath conflict nahi).
 - 29 Oct raat, v1.0.1 rebuild: recordings ab ek saath sirf 3 upload hoti hain (pehle sab ek saath → timeouts), upload timeout 60 s aur timeout par native upload cancel; CRM 400/413/422 wala batch ab 16 baar retry nahi hota, failed archive mein jaake baaki batches chalte rehte hain; "latest call recording missing" ab poora push block nahi karta (sirf warn, recording agli sync mein retry); Call logs par "Push all" ab storage se exact acknowledged IDs padhta hai.
 
+## 2 Nov: v1.0.3 (versionCode 4) — recording ledger + freeze fix
+- Naya `src/services/recordingLedger.ts`: har matched recording ki entry phone par save (pending / uploaded / failed / rejected, CRM URL, attempts, call log ki copy).
+- Upload fail/timeout hui recording ab bhooli nahi jaati: har auto-sync (`retryPendingRecordings`) pehle inhe dobara upload karta hai (max 10 koshish). Upload ho chuki recording dobara kabhi upload nahi hoti (URL ledger mein).
+- CRM purani call par recording attach nahi karta (duplicate par kuch nahi karta), isliye jis call ki recording pending hai wo call log hold hota hai aur recording ke saath hi jaata hai. Call logs mein "Waiting for recording" dikhta hai.
+- 25 MB se badi file upload se pehle hi reject ("Recording too large"). File gayab ho to bhi reject. Timeout ab size ke hisaab se: 60 s + 30 s/MB, max 5 min.
+- Freeze fix: recording matching ab sirf ±6 ghante ki files par chalta hai, timestamps ek baar parse, har 8 calls ke baad UI thread ko mauka. Bade payload ke debug logs hataye.
+- Call logs screen par har call ke neeche recording ka status pill (uploaded / pending / failed / too large). Sign out par ledger clear.
+
 ## 30 Oct: "testers download nahi kar paa rahe" + "Play par 15 MB" ki jaanch
 - **Tester list ka issue (fix ho gaya):** Play Console mein do email lists thi: "Gaincafe internal" (2 emails, tick thi) aur
   "1st Tester" (5 emails: abhayprajapati1000@gmail.com, ray@gaincafe.com, team@gaincafe.com, vibhanshu@gaincafe.com,

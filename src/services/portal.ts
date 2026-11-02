@@ -5,6 +5,18 @@ import { enrichCallLogsWithContactNames } from './callLogNames';
 import { AuthError, CRM_API_BASE_URL, clearSession, getAuthHeaders, getSession } from './auth';
 import { filterLeadCalls, findLeadForCall, getLeadPhoneIndex } from './leadIndex';
 import { getAllCallSyncEnabled } from './appSettings';
+import {
+  MAX_RECORDING_BYTES,
+  getCallsNeedingRetry,
+  getLedgerEntriesForCall,
+  getLedgerEntry,
+  hasPendingRecording,
+  markRecordingAttemptFailed,
+  markRecordingRejected,
+  markRecordingUploaded,
+  markRecordingsQueued,
+  registerRecording,
+} from './recordingLedger';
 
 /**
  * Gaincafe CRM call-sync endpoints. Both require the per-agent headers from
@@ -56,6 +68,13 @@ const UPLOAD_TIMEOUT_MS = 60 * 1000;
 const SYNC_TIMEOUT_MS = 60 * 1000;
 /** How many calls have their recordings uploaded at the same time during a big push. */
 const UPLOAD_CONCURRENCY = 3;
+const UPLOAD_TIMEOUT_MAX_MS = 5 * 60 * 1000;
+
+/** 60 s minimum, plus 30 s per MB, capped at 5 minutes: big files on slow data get a fair chance. */
+function uploadTimeoutForSize(sizeBytes?: number): number {
+  const mb = Math.ceil((sizeBytes ?? 0) / (1024 * 1024));
+  return Math.min(UPLOAD_TIMEOUT_MAX_MS, Math.max(UPLOAD_TIMEOUT_MS, mb * 30 * 1000));
+}
 
 /** Like Promise.all(items.map(fn)) but never runs more than `limit` fn calls at once. */
 async function mapWithConcurrency<T, R>(
@@ -580,6 +599,8 @@ export interface PushResult {
   success: boolean;
   message: string;
   count?: number;
+  /** Calls kept back because their recording upload is still pending (retried automatically). */
+  heldForRecording?: number;
   results?: Array<{
     phone_number: string;
     normalized?: string;
@@ -739,6 +760,26 @@ function strictRecordingMatchesCall(recording: Record<string, unknown>, log: Rec
   return !recAt || !callAt || Math.abs(recAt - callAt) <= STRICT_PAIR_WINDOW_MS;
 }
 
+function rememberUploadedRecording(
+  recording: Record<string, unknown>,
+  callId: string,
+  externalId: string,
+  url: string
+): Record<string, unknown> {
+  if (externalId) uploadedRecordingUrlByExternalId.set(externalId, url);
+  const list = uploadedRecordingsByCallId.get(callId) ?? [];
+  list.push({
+    recording_url: url,
+    recording_external_id: externalId,
+    duration_seconds: recording.duration_seconds,
+    source: recording.source,
+    recorded_at: recording.recorded_at,
+    __uploaded_for_call_id: callId,
+  });
+  uploadedRecordingsByCallId.set(callId, list);
+  return { ...recording, recording_url: url };
+}
+
 async function uploadRecordingIfNeeded(
   recording: Record<string, unknown>,
   callId: string,
@@ -746,35 +787,51 @@ async function uploadRecordingIfNeeded(
 ): Promise<Record<string, unknown> | null> {
   const rawUrl = typeof recording.recording_url === 'string' ? recording.recording_url : '';
   const externalId = String(recording.recording_external_id ?? '');
-  // Reuse already uploaded URL for same stable recording_external_id.
-  // This avoids repeated uploads across retries/auto-runs in same app session.
+  // Same app session: reuse the URL of an upload that already succeeded.
   if (externalId) {
     const cachedUrl = uploadedRecordingUrlByExternalId.get(externalId);
-    if (cachedUrl) {
-      const cached: Record<string, unknown> = {
-        ...recording,
-        recording_url: cachedUrl,
-      };
-      const list = uploadedRecordingsByCallId.get(callId) ?? [];
-      list.push({
-        recording_url: cachedUrl,
-        recording_external_id: externalId,
-        duration_seconds: recording.duration_seconds,
-        source: recording.source,
-        recorded_at: recording.recorded_at,
-        __uploaded_for_call_id: callId,
-      });
-      uploadedRecordingsByCallId.set(callId, list);
-      return cached;
-    }
+    if (cachedUrl) return rememberUploadedRecording(recording, callId, externalId, cachedUrl);
   }
   if (!rawUrl) return recording;
   if (!rawUrl.startsWith('file://')) return recording;
   if (!RECORDING_UPLOAD_URL) return null;
 
+  // Across app restarts: the ledger knows what was uploaded and what is hopeless.
+  const ledgerEntry = externalId ? await getLedgerEntry(externalId) : undefined;
+  if (ledgerEntry?.status === 'uploaded' && ledgerEntry.url) {
+    return rememberUploadedRecording(recording, callId, externalId, ledgerEntry.url);
+  }
+  if (ledgerEntry && (ledgerEntry.status === 'rejected' || ledgerEntry.status === 'failed')) {
+    return null;
+  }
+
   const filePath = rawUrl.replace('file://', '');
   const exists = await RNFS.exists(filePath);
-  if (!exists) return null;
+  if (!exists) {
+    if (externalId) await markRecordingRejected(externalId, 'Recording file no longer exists on the phone');
+    return null;
+  }
+  let sizeBytes: number | undefined;
+  try {
+    const st = await RNFS.stat(filePath);
+    sizeBytes = Number(st.size);
+    if (!Number.isFinite(sizeBytes)) sizeBytes = undefined;
+  } catch {
+    sizeBytes = undefined;
+  }
+  if (sizeBytes != null && sizeBytes > MAX_RECORDING_BYTES) {
+    const mb = (sizeBytes / (1024 * 1024)).toFixed(1);
+    console.warn('[upload] recording over CRM size limit, skipped', { callId, externalId, mb });
+    if (externalId) await markRecordingRejected(externalId, `Recording is ${mb} MB, over the CRM limit of 25 MB`, sizeBytes);
+    return null;
+  }
+  const timeoutMs = uploadTimeoutForSize(sizeBytes);
+
+  const fail = async (reason: string): Promise<null> => {
+    console.warn('[upload] recording upload failed', { callId, externalId, reason });
+    if (externalId) await markRecordingAttemptFailed(externalId, reason);
+    return null;
+  };
 
   try {
     const filename = filePath.split('/').pop() || 'recording.mp3';
@@ -793,7 +850,7 @@ async function uploadRecordingIfNeeded(
       method: 'POST',
       headers: uploadHeaders,
       fields: {
-        recording_external_id: String(recording.recording_external_id ?? ''),
+        recording_external_id: externalId,
         source: String(recording.source ?? 'mobile_app'),
       },
     });
@@ -802,7 +859,7 @@ async function uploadRecordingIfNeeded(
     const uploadRes = await Promise.race([
       uploadJob.promise,
       new Promise<null>((resolve) => {
-        timeoutHandle = setTimeout(() => resolve(null), UPLOAD_TIMEOUT_MS);
+        timeoutHandle = setTimeout(() => resolve(null), timeoutMs);
       }),
     ]).finally(() => {
       if (timeoutHandle) clearTimeout(timeoutHandle);
@@ -814,12 +871,17 @@ async function uploadRecordingIfNeeded(
       } catch {
         // ignore
       }
-      console.warn('[upload] recording upload timed out', { callId, externalId });
-      return null;
+      return fail(`Upload timed out after ${Math.round(timeoutMs / 1000)} s`);
     }
 
     if (uploadRes.statusCode < 200 || uploadRes.statusCode >= 300) {
-      return null;
+      const body = (uploadRes.body || '').slice(0, 200);
+      if (uploadRes.statusCode === 413 || uploadRes.statusCode === 422) {
+        // The CRM will never accept this file as it is.
+        if (externalId) await markRecordingRejected(externalId, `CRM refused the file (${uploadRes.statusCode}) ${body}`.trim(), sizeBytes);
+        return null;
+      }
+      return fail(`CRM responded ${uploadRes.statusCode} ${body}`.trim());
     }
 
     let uploadedUrl = '';
@@ -834,29 +896,11 @@ async function uploadRecordingIfNeeded(
       uploadedUrl = '';
     }
 
-    if (!uploadedUrl) return null;
-    if (externalId) {
-      uploadedRecordingUrlByExternalId.set(externalId, uploadedUrl);
-    }
-    const uploaded: Record<string, unknown> = {
-      ...recording,
-      recording_url: uploadedUrl,
-    };
-    // Save upload mapping per callId immediately after upload success.
-    const key = callId;
-    const list = uploadedRecordingsByCallId.get(key) ?? [];
-    list.push({
-      recording_url: String(uploaded.recording_url ?? ''),
-      recording_external_id: String(recording.recording_external_id ?? ''),
-      duration_seconds: recording.duration_seconds,
-      source: recording.source,
-      recorded_at: recording.recorded_at,
-      __uploaded_for_call_id: callId,
-    });
-    uploadedRecordingsByCallId.set(key, list);
-    return uploaded;
-  } catch {
-    return null;
+    if (!uploadedUrl) return fail('CRM response had no recording URL');
+    if (externalId) await markRecordingUploaded(externalId, uploadedUrl, sizeBytes);
+    return rememberUploadedRecording(recording, callId, externalId, uploadedUrl);
+  } catch (e) {
+    return fail(e instanceof Error ? e.message : 'Network error');
   }
 }
 
@@ -944,11 +988,10 @@ export async function pushCallsToPortal(
         return !!recCallId && recCallId === String(c.id) && currentCallIds.has(recCallId);
       });
       const calledAt = toCalledAt(c);
-      await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id, authHeaders)));
       const phoneNumber = c.phoneNumber || c.formattedNumber || '';
       const contactName = (c.name || '').trim();
       const leadName = findLeadForCall(leadIndex, c)?.name ?? '';
-      return {
+      const logFields = {
         id: c.id,
         callId: c.id,
         phone_number: phoneNumber,
@@ -957,6 +1000,28 @@ export async function pushCallsToPortal(
         duration_seconds: c.duration,
         called_at: calledAt,
       };
+      // Remember every matched recording before trying, so a failed or interrupted
+      // upload is retried later instead of being forgotten.
+      for (const r of mergedRecordingsRaw) {
+        const url = String(r.recording_url ?? '');
+        const extId = String(r.recording_external_id ?? '');
+        if (!extId || !url.startsWith('file://')) continue;
+        const filePath = url.replace('file://', '');
+        await registerRecording({
+          externalId: extId,
+          callId: String(c.id),
+          filePath,
+          fileName: filePath.split('/').pop() || '',
+          log: logFields,
+          recording: {
+            duration_seconds: typeof r.duration_seconds === 'number' ? r.duration_seconds : undefined,
+            source: String(r.source ?? 'mobile_app'),
+            recorded_at: typeof r.recorded_at === 'string' ? r.recorded_at : undefined,
+          },
+        });
+      }
+      await Promise.all(mergedRecordingsRaw.map((r) => uploadRecordingIfNeeded(r, c.id, authHeaders)));
+      return logFields;
     });
 
     const uploadSucceededCount = Array.from(uploadedRecordingsByCallId.values()).reduce(
@@ -1044,8 +1109,30 @@ export async function pushCallsToPortal(
       };
     });
 
+    // A call whose recording upload is still pending (failed or timed out, attempts
+    // left) waits, so call log and recording reach the CRM together: the CRM does not
+    // attach recordings to a call it already has. retryPendingRecordings() resends it.
+    const heldCallIds = new Set<string>();
+    for (const log of logs) {
+      const id = String(log.callId ?? log.id ?? '');
+      if (hasPendingRecording(await getLedgerEntriesForCall(id))) heldCallIds.add(id);
+    }
+    const logsToSend = logs.filter((l) => !heldCallIds.has(String(l.callId ?? l.id ?? '')));
+    if (heldCallIds.size > 0) {
+      console.log('[sync-hold] calls waiting for recording upload', { held: heldCallIds.size });
+    }
+    if (logsToSend.length === 0) {
+      return {
+        success: false,
+        heldForRecording: heldCallIds.size,
+        message: heldCallIds.size === 1
+          ? 'Recording upload did not finish. This call will be sent with its recording on the next automatic retry.'
+          : `Recording uploads did not finish for ${heldCallIds.size} calls. They will be sent with their recordings on the next automatic retry.`,
+      };
+    }
+
     const payload: SyncPayload = {
-      logs,
+      logs: logsToSend,
       ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
       ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
       sentAt: new Date().toISOString(),
@@ -1150,15 +1237,6 @@ export async function pushCallsToPortal(
       });
     }
     console.log('[sync-payload] logs[0].recordings?.length =', (payload.logs[0] as { recordings?: unknown[] } | undefined)?.recordings?.length ?? 0);
-    console.log('[sync-payload] first 2 logs =', payload.logs.slice(0, 2));
-    const firstWithRecordings = payload.logs.find(
-      (l) => ((l as { recordings?: unknown[] }).recordings?.length ?? 0) > 0
-    );
-    if (firstWithRecordings) {
-      console.log('[sync-payload] sample with recordings =', firstWithRecordings);
-    } else {
-      console.log('[sync-payload] no non-empty recordings before /sync (expected if batch has no matched files)');
-    }
     console.log('[sync-payload] first 2 callId+recordings.length =', first2Compact);
     // The CRM accepts at most MAX_LOGS_PER_BATCH logs per request, so a large
     // "Push to portal" is split into several queued batches sent one after another.
@@ -1191,7 +1269,20 @@ export async function pushCallsToPortal(
     if (chunks.length > 1) {
       console.log('[sync-payload] split into batches', { batches: chunks.length, total: payload.logs.length });
     }
-    return flushPendingSyncBatches(headers);
+    // These calls are now in the durable queue: their recordings need no ledger retry.
+    const queuedExternalIds: string[] = [];
+    for (const l of logsToSend) {
+      const entries = await getLedgerEntriesForCall(String(l.callId ?? l.id ?? ''));
+      entries.filter((e) => e.status !== 'pending').forEach((e) => queuedExternalIds.push(e.externalId));
+    }
+    await markRecordingsQueued(queuedExternalIds);
+    const flushResult = await flushPendingSyncBatches(headers);
+    if (heldCallIds.size === 0) return flushResult;
+    return {
+      ...flushResult,
+      heldForRecording: heldCallIds.size,
+      message: `${flushResult.message} ${heldCallIds.size} call(s) are waiting for their recording upload and will be retried automatically.`,
+    };
   } catch (e) {
     const isAbort = e instanceof Error && e.name === 'AbortError';
     const msg = isAbort
@@ -1227,6 +1318,110 @@ export async function flushPendingSyncQueue(): Promise<PushResult | null> {
   } catch (e) {
     return { success: false, message: e instanceof Error ? e.message : 'Network error' };
   } finally {
+    syncRequestInFlight = false;
+  }
+}
+
+export interface RecordingRetrySummary {
+  /** recordings uploaded in this run */
+  uploaded: number;
+  /** calls (with their recordings) handed to the sync queue in this run */
+  sent: number;
+  /** calls still waiting because a recording upload failed again */
+  waiting: number;
+}
+
+/**
+ * Background retry for recordings whose upload failed, timed out, or was cut
+ * off: upload again from the ledger, and once every recording of a call is
+ * settled (uploaded, rejected or given up), send that call to the CRM.
+ * Returns null when there is nothing to retry.
+ */
+export async function retryPendingRecordings(): Promise<RecordingRetrySummary | null> {
+  const byCall = await getCallsNeedingRetry();
+  if (byCall.size === 0) return null;
+  if (syncRequestInFlight) return null;
+  syncRequestInFlight = true;
+  const summary: RecordingRetrySummary = { uploaded: 0, sent: 0, waiting: 0 };
+  try {
+    const authHeaders = await getAuthHeaders();
+    const headers: Record<string, string> = { ...authHeaders, 'Content-Type': 'application/json' };
+    const deviceInfo = await getEffectiveDeviceInfo();
+    const allCallSync = await getAllCallSyncEnabled();
+    const logsToSend: SyncPayloadLog[] = [];
+    const queuedIds: string[] = [];
+    console.log('[recording-retry] calls to retry', { calls: byCall.size });
+
+    for (const [callId, entries] of byCall) {
+      for (const e of entries) {
+        if (e.status !== 'pending') continue;
+        const result = await uploadRecordingIfNeeded(
+          {
+            recording_url: `file://${e.filePath}`,
+            recording_external_id: e.externalId,
+            duration_seconds: e.recording.duration_seconds,
+            source: e.recording.source,
+            recorded_at: e.recording.recorded_at,
+          },
+          callId,
+          authHeaders
+        );
+        const url = result && typeof result.recording_url === 'string' ? result.recording_url : '';
+        if (url && !url.startsWith('file://')) summary.uploaded += 1;
+      }
+      const fresh = await getLedgerEntriesForCall(callId);
+      if (fresh.length === 0) continue;
+      if (hasPendingRecording(fresh)) {
+        summary.waiting += 1;
+        continue;
+      }
+      const recordings = fresh
+        .filter((e) => e.status === 'uploaded' && !!e.url)
+        .map((e) => ({
+          recording_url: e.url,
+          recording_external_id: e.externalId,
+          duration_seconds: e.recording.duration_seconds,
+          source: e.recording.source,
+          recorded_at: e.recording.recorded_at,
+        }));
+      logsToSend.push({ ...fresh[0].log, recordings });
+      fresh.forEach((e) => queuedIds.push(e.externalId));
+    }
+
+    if (logsToSend.length > 0) {
+      for (let i = 0; i < logsToSend.length; i += MAX_LOGS_PER_BATCH) {
+        const chunkLogs = logsToSend.slice(i, i + MAX_LOGS_PER_BATCH);
+        const signature = chunkLogs
+          .map((l) => `${l.callId}|${l.called_at}|${(l.recordings ?? []).map((r) => String(r.recording_external_id ?? '')).sort().join(',')}`)
+          .join('||');
+        await enqueuePendingSyncBatch({
+          id: makeDeterministicBatchId(signature) || makeBatchId(),
+          signature,
+          priority: 'normal',
+          recordingItems: chunkLogs.reduce((acc, l) => acc + (l.recordings?.length ?? 0), 0),
+          createdAt: Date.now(),
+          attempts: 0,
+          nextRetryAt: Date.now(),
+          payload: {
+            logs: chunkLogs,
+            ...(deviceInfo.deviceName ? { deviceName: deviceInfo.deviceName } : {}),
+            ...(deviceInfo.devicePhone ? { devicePhone: deviceInfo.devicePhone } : {}),
+            sentAt: new Date().toISOString(),
+            create_unmatched_leads: allCallSync,
+          },
+        });
+      }
+      await markRecordingsQueued(queuedIds);
+      summary.sent = logsToSend.length;
+      await flushPendingSyncBatches(headers);
+    }
+    console.log('[recording-retry] done', summary);
+    return summary;
+  } catch (e) {
+    console.warn('[recording-retry] failed', e instanceof Error ? e.message : e);
+    return summary;
+  } finally {
+    uploadedRecordingsByCallId.clear();
     syncRequestInFlight = false;
   }
 }

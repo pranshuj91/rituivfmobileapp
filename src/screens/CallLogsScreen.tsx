@@ -32,6 +32,7 @@ import {
   type LeadPhoneIndex,
 } from '../services/leadIndex';
 import { getAllCallSyncEnabled } from '../services/appSettings';
+import { getRecordingStatusByCall, type CallRecordingSummary } from '../services/recordingLedger';
 import { theme } from '../theme';
 
 const CALL_LOG_PERMISSIONS = [
@@ -124,6 +125,30 @@ interface CallLogItemProps {
   pushing: boolean;
   synced: boolean;
   leadName?: string;
+  recording?: CallRecordingSummary;
+}
+
+function recordingPill(rec: CallRecordingSummary): { label: string; icon: string; color: string; bg: string } {
+  switch (rec.status) {
+    case 'uploaded':
+      return { label: 'Recording uploaded', icon: 'microphone', color: theme.colors.success, bg: '#DCFCE7' };
+    case 'pending':
+      return {
+        label: rec.attempts > 0 ? `Recording pending (try ${rec.attempts + 1})` : 'Recording pending',
+        icon: 'microphone-settings',
+        color: '#B45309',
+        bg: '#FEF3C7',
+      };
+    case 'rejected':
+      return {
+        label: /MB/.test(rec.lastError ?? '') ? 'Recording too large (25 MB limit)' : 'Recording skipped',
+        icon: 'microphone-off',
+        color: theme.colors.error,
+        bg: '#FEE2E2',
+      };
+    default:
+      return { label: 'Recording failed', icon: 'microphone-off', color: theme.colors.error, bg: '#FEE2E2' };
+  }
 }
 
 function formatLastSync(ms: number | null): string {
@@ -131,7 +156,8 @@ function formatLastSync(ms: number | null): string {
   return `Last sync: ${new Date(ms).toLocaleString()}`;
 }
 
-function CallLogItemRow({ item, onPush, pushing, synced, leadName }: CallLogItemProps) {
+function CallLogItemRow({ item, onPush, pushing, synced, leadName, recording }: CallLogItemProps) {
+  const pill = recording ? recordingPill(recording) : null;
   return (
     <View style={styles.logItem}>
       <View style={styles.logMain}>
@@ -154,6 +180,12 @@ function CallLogItemRow({ item, onPush, pushing, synced, leadName }: CallLogItem
           <View style={styles.leadRow}>
             <Icon name="account-check-outline" size={14} color={theme.colors.primary} />
             <Text style={styles.leadName} numberOfLines={1}>Lead: {leadName}</Text>
+          </View>
+        ) : null}
+        {pill ? (
+          <View style={[styles.recPill, { backgroundColor: pill.bg }]}>
+            <Icon name={pill.icon} size={12} color={pill.color} />
+            <Text style={[styles.recPillText, { color: pill.color }]} numberOfLines={1}>{pill.label}</Text>
           </View>
         ) : null}
       </View>
@@ -193,10 +225,12 @@ export function CallLogsScreen() {
   const [hiddenCount, setHiddenCount] = useState(0);
   const [showExplainer, setShowExplainer] = useState(false);
   const [allCallSync, setAllCallSync] = useState(false);
+  const [recStatus, setRecStatus] = useState<Map<string, CallRecordingSummary>>(new Map());
 
   const refreshLastSync = useCallback(async () => {
-    const [last, ids] = await Promise.all([getLastSyncedAt(), getSyncedCallIds()]);
+    const [last, ids, rec] = await Promise.all([getLastSyncedAt(), getSyncedCallIds(), getRecordingStatusByCall()]);
     setLastSyncedAtMs(last);
+    setRecStatus(rec);
     // Calls the CRM has acknowledged, persisted across app restarts. Only replace
     // the in-session set when the stored list has something, so ticks from a
     // push made moments ago are never lost.
@@ -318,7 +352,11 @@ export function CallLogsScreen() {
         await setLastSyncedAt(now);
         setLastSyncedAtMs(now);
       }
-      Alert.alert(result.success ? 'Sent' : 'Error', result.message);
+      setRecStatus(await getRecordingStatusByCall());
+      Alert.alert(
+        result.success ? 'Sent' : result.heldForRecording ? 'Waiting for recording' : 'Error',
+        result.message
+      );
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to push call';
       Alert.alert('Error', msg);
@@ -339,6 +377,7 @@ export function CallLogsScreen() {
       // The CRM acknowledges logs per batch; read back exactly which ones it
       // accepted instead of marking everything as synced on success.
       setSyncedIds(await getSyncedCallIds());
+      setRecStatus(await getRecordingStatusByCall());
       if (result.success) {
         const now = Date.now();
         await setLastSyncedAt(now);
@@ -456,6 +495,7 @@ export function CallLogsScreen() {
                 pushing={pushingId === item.id}
                 synced={syncedIds.has(item.id)}
                 leadName={findLeadForCall(leadIndex, item)?.name || undefined}
+                recording={recStatus.get(item.id)}
               />
             )}
             style={styles.list}
@@ -653,6 +693,20 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 4,
     marginLeft: theme.spacing.xs,
+  },
+  recPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    gap: 4,
+    marginTop: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 999,
+  },
+  recPillText: {
+    fontSize: 11,
+    fontWeight: '600',
   },
   syncedText: {
     fontSize: 13,

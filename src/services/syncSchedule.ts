@@ -16,6 +16,7 @@ import {
   getLastSyncedAt,
   pushCallsToPortal,
   flushPendingSyncQueue,
+  retryPendingRecordings,
   setLastSyncedAt,
 } from './portal';
 import { buildRecordingSyncOptions } from './recordings';
@@ -104,6 +105,17 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
       console.log('[auto-sync] queued batches', { success: flushed.success, message: flushed.message });
     }
     const queuedNote = flushed?.success ? ' Queued calls from earlier were sent.' : '';
+    // Recordings whose upload failed or was interrupted earlier: try again and,
+    // once a call's recordings are settled, send that call to the CRM.
+    const retried = await retryPendingRecordings();
+    if (retried) {
+      console.log('[auto-sync] recording retry', retried);
+    }
+    const retryNote = retried && retried.sent > 0
+      ? ` ${retried.sent} earlier call(s) sent with their recordings.`
+      : retried && retried.waiting > 0
+        ? ` ${retried.waiting} call(s) still waiting for a recording upload.`
+        : '';
 
     const lastSyncedAt = await getLastSyncedAt();
     const minTs = lastSyncedAt ?? 0;
@@ -116,7 +128,7 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
       if (flushed && !flushed.success) {
         return { status: 'failed', message: flushed.message, sent: 0 };
       }
-      return { status: 'nothing', message: `No new calls since the last sync.${queuedNote}`, sent: 0 };
+      return { status: 'nothing', message: `No new calls since the last sync.${queuedNote}${retryNote}`, sent: 0 };
     }
     const newestTs = Math.max(...loaded.map(getCallTimeMs));
 
@@ -134,7 +146,7 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
       if (callsToSend.length === 0) {
         // Nothing to sync in this window; move the cursor so these are not re-read.
         await setLastSyncedAt(newestTs);
-        return { status: 'nothing', message: `No new calls with CRM leads since the last sync.${queuedNote}`, sent: 0 };
+        return { status: 'nothing', message: `No new calls with CRM leads since the last sync.${queuedNote}${retryNote}`, sent: 0 };
       }
     }
 
@@ -142,12 +154,19 @@ export async function runScheduledSync(): Promise<ScheduledSyncResult> {
     let lastMessage = 'Sync failed.';
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
       const result = await pushCallsToPortal(callsToSend, syncOptions, 'auto');
-      if (result.success) {
+      // Calls held back for a pending recording live in the ledger and are retried
+      // by retryPendingRecordings(); everything else is in the durable queue. Either
+      // way these calls need not be re-read from the phone, so the cursor moves on.
+      if (result.success || result.heldForRecording) {
         await setLastSyncedAt(newestTs);
+        const held = result.heldForRecording ?? 0;
+        const sentNow = Math.max(0, callsToSend.length - held);
         return {
           status: 'synced',
-          message: `${callsToSend.length} call${callsToSend.length === 1 ? '' : 's'}${allCallSync ? '' : ' with leads'} sent to the CRM.`,
-          sent: callsToSend.length,
+          message: held > 0
+            ? `${sentNow} call${sentNow === 1 ? '' : 's'} sent to the CRM. ${held} waiting for recording upload, retried automatically.${retryNote}`
+            : `${callsToSend.length} call${callsToSend.length === 1 ? '' : 's'}${allCallSync ? '' : ' with leads'} sent to the CRM.${retryNote}`,
+          sent: sentNow,
         };
       }
       lastMessage = result.message;

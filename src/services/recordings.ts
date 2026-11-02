@@ -287,16 +287,26 @@ export async function buildRecordingSyncOptions(calls: CallLog[]): Promise<SyncO
     const oldestCallTs = callTimes.length > 0 ? Math.min(...callTimes) : 0;
     const sinceLastSync = lastSyncedAt ? lastSyncedAt - RECENT_FILE_BUFFER_MS : 0;
     const minFileTs = Math.max(0, Math.min(sinceLastSync, oldestCallTs > 0 ? oldestCallTs - RECENT_FILE_BUFFER_MS : sinceLastSync));
-    let files = allFiles.filter((f) => preferredFileTimeMs(f) >= minFileTs);
+    // File timestamps are parsed from the name with regexes; cache them once per
+    // file instead of re-parsing inside every filter and sort below.
+    const tsCache = new Map<string, number>();
+    const tsOf = (f: { path: string; name: string; mtimeMs: number }): number => {
+      let t = tsCache.get(f.path);
+      if (t === undefined) {
+        t = preferredFileTimeMs(f);
+        tsCache.set(f.path, t);
+      }
+      return t;
+    };
+    let files = allFiles.filter((f) => tsOf(f) >= minFileTs);
     // Some dialers report stale mtime/parsed timestamps; fallback to last 24h scope for discovery.
     if (files.length === 0) {
       const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-      files = allFiles.filter((f) => preferredFileTimeMs(f) >= dayAgo);
+      files = allFiles.filter((f) => tsOf(f) >= dayAgo);
     }
     console.log('[recording-debug] discovery', {
       allFilesCount: allFiles.length,
       selectedFilesCount: files.length,
-      sampleSelected: files.slice(0, 10).map((f) => ({ name: f.name, path: f.path })),
     });
     if (files.length === 0) return {};
 
@@ -305,35 +315,39 @@ export async function buildRecordingSyncOptions(calls: CallLog[]): Promise<SyncO
     // Newest-first helps avoid older calls consuming nearby recordings first.
     const sortedCalls = [...calls].sort((a, b) => callTimeMs(b) - callTimeMs(a));
     const debugLatestCallIds = new Set(sortedCalls.slice(0, 5).map((c) => String(c.id)));
+    let processed = 0;
     for (const c of sortedCalls) {
+      processed += 1;
+      // Matching hundreds of calls against thousands of files is pure JS work;
+      // give the UI thread a turn every few calls so the app stays responsive.
+      if (processed % 8 === 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
       const ts = callTimeMs(c);
       if (!ts) continue;
 
       const digits = normalizeDigits(c.phoneNumber || c.formattedNumber);
-      const unmatchedCandidates = files
-        .filter((f) => !usedPaths.has(f.path))
+      // Only files inside the widest matching window are worth the name/regex passes.
+      const nearby = files.filter((f) => !usedPaths.has(f.path) && Math.abs(ts - tsOf(f)) <= FALLBACK_MATCH_WINDOW_MS);
+      const unmatchedCandidates = nearby
         .filter((f) => hasSamePhoneInName(f.name, digits));
-      const matches = files
-        .filter((f) => !usedPaths.has(f.path))
+      const matches = nearby
         .filter((f) => belongsToCall(f, c, ts, digits))
         .sort((a, b) => matchScore(b.name, c.id, digits, ts, b.mtimeMs) - matchScore(a.name, c.id, digits, ts, a.mtimeMs))
         .slice(0, 2);
-      const fallbackByPhoneNearest = files
-        .filter((f) => !usedPaths.has(f.path))
+      const fallbackByPhoneNearest = nearby
         .filter((f) => hasSamePhoneInName(f.name, digits))
-        .filter((f) => Math.abs(ts - preferredFileTimeMs(f)) <= FALLBACK_MATCH_WINDOW_MS)
-        .sort((a, b) => Math.abs(ts - preferredFileTimeMs(a)) - Math.abs(ts - preferredFileTimeMs(b)))
+        .filter((f) => Math.abs(ts - tsOf(f)) <= FALLBACK_MATCH_WINDOW_MS)
+        .sort((a, b) => Math.abs(ts - tsOf(a)) - Math.abs(ts - tsOf(b)))
         .slice(0, 1);
-      const fallbackByNameNearest = files
-        .filter((f) => !usedPaths.has(f.path))
+      const fallbackByNameNearest = nearby
         .filter((f) => hasContactNameInFile(f.name, c.name))
-        .filter((f) => Math.abs(ts - preferredFileTimeMs(f)) <= FALLBACK_MATCH_WINDOW_MS)
-        .sort((a, b) => Math.abs(ts - preferredFileTimeMs(a)) - Math.abs(ts - preferredFileTimeMs(b)))
+        .filter((f) => Math.abs(ts - tsOf(f)) <= FALLBACK_MATCH_WINDOW_MS)
+        .sort((a, b) => Math.abs(ts - tsOf(a)) - Math.abs(ts - tsOf(b)))
         .slice(0, 1);
-      const fallbackByTimeOnly = files
-        .filter((f) => !usedPaths.has(f.path))
-        .filter((f) => Math.abs(ts - preferredFileTimeMs(f)) <= 90 * 1000)
-        .sort((a, b) => Math.abs(ts - preferredFileTimeMs(a)) - Math.abs(ts - preferredFileTimeMs(b)))
+      const fallbackByTimeOnly = nearby
+        .filter((f) => Math.abs(ts - tsOf(f)) <= 90 * 1000)
+        .sort((a, b) => Math.abs(ts - tsOf(a)) - Math.abs(ts - tsOf(b)))
         .slice(0, 1);
       const finalMatches =
         matches.length > 0 || isMissedType(c.type)

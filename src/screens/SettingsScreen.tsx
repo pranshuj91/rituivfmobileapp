@@ -32,13 +32,14 @@ import {
   type BrandProfile,
   type DeviceInfo,
 } from '../services/deviceProfile';
+import { clearRecordingLedger } from '../services/recordingLedger';
 import { getAllCallSyncEnabled, setAllCallSyncEnabled } from '../services/appSettings';
 import { AppDialog, type AppDialogProps } from '../components/AppDialog';
 import { theme } from '../theme';
 
 type DialogState = Omit<AppDialogProps, 'visible'>;
 
-const APP_VERSION = '1.0.2';
+const APP_VERSION = '1.0.3';
 const CRM_HOST = CRM_API_BASE_URL.replace(/^https?:\/\//, '').split('/')[0];
 
 /**
@@ -250,6 +251,8 @@ export function SettingsScreen() {
     try {
       await logout();
       await clearLeadPhoneIndex();
+      // Recording ledger holds phone numbers of this workspace's calls: not for the next user.
+      await clearRecordingLedger();
       // The session listener in App switches to the login screen.
     } finally {
       setLoggingOut(false);
